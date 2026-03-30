@@ -22,7 +22,7 @@ function formatLocalTimestamp(date = new Date()) {
   const hours = String(date.getHours()).padStart(2, '0');
   const minutes = String(date.getMinutes()).padStart(2, '0');
   const seconds = String(date.getSeconds()).padStart(2, '0');
-  return `${year}${month}${day}-${hours}${minutes}${seconds}`;
+  return `${year}-${month}-${day}_${hours}${minutes}${seconds}`;
 }
 
 function yamlQuoted(value) {
@@ -41,6 +41,13 @@ function triggerDownload(content, fileName, mime) {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function readExportProgress(runId) {
+  const key = String(runId || '');
+  if (!key) return null;
+  const store = window.__CLAUDE_EXPORT_RUNS || {};
+  return store[key] || null;
 }
 
 function buildObsidianMarkdown({ title, htmlFileName, sourceUrl }) {
@@ -89,11 +96,55 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
   }
 
   try {
-    const results = await chrome.scripting.executeScript({
+    const runId = `claude-export-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    let pollTimer = null;
+    let pollBusy = false;
+
+    const stopPolling = () => {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    };
+
+    const pollProgress = async () => {
+      if (pollBusy) return;
+      pollBusy = true;
+      try {
+        const [progressResult] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: readExportProgress,
+          args: [runId],
+          world: 'MAIN'
+        });
+        const progress = progressResult && progressResult.result;
+        if (progress && progress.message) {
+          status.textContent = progress.message;
+        }
+      } catch (e) {
+        // Popup polling is best-effort; final result still comes from the main export call.
+      } finally {
+        pollBusy = false;
+      }
+    };
+
+    const exportPromise = chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: extractAndBuild,
+      args: [runId],
       world: 'MAIN'
     });
+    pollTimer = setInterval(() => {
+      pollProgress();
+    }, 350);
+    await pollProgress();
+
+    let results;
+    try {
+      results = await exportPromise;
+    } finally {
+      stopPolling();
+    }
 
     const { html, title, error } = results[0].result;
 
@@ -104,7 +155,7 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
       return;
     }
 
-    const baseName = sanitizeBaseName(`${formatLocalTimestamp()}-${title || 'claude-chat'}`);
+    const baseName = sanitizeBaseName(`${title || 'claude-chat'}_${formatLocalTimestamp()}`);
     const htmlFileName = `${baseName}.html`;
     const mdFileName = `${baseName}.md`;
     const md = buildObsidianMarkdown({
@@ -129,7 +180,30 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
 // =====================================================================
 // 以下函数在页面上下文（claude.ai）中执行
 // =====================================================================
-function extractAndBuild() {
+function extractAndBuild(runId) {
+  const exportRunId = String(runId || `claude-export-${Date.now()}`);
+  const progressStore = window.__CLAUDE_EXPORT_RUNS || (window.__CLAUDE_EXPORT_RUNS = {});
+  const setProgress = (patch) => {
+    progressStore[exportRunId] = {
+      runId: exportRunId,
+      updatedAt: Date.now(),
+      ...(progressStore[exportRunId] || {}),
+      ...patch,
+    };
+  };
+  const scheduleProgressCleanup = () => {
+    setTimeout(() => {
+      if (progressStore[exportRunId]) delete progressStore[exportRunId];
+    }, 30000);
+  };
+  const fail = (error) => {
+    const message = `提取失败：${error}`;
+    setProgress({ state: 'error', stage: 'error', message });
+    scheduleProgressCleanup();
+    return { html: null, title: '', error };
+  };
+
+  setProgress({ state: 'running', stage: 'extract', message: '正在提取聊天记录…', completed: 0, total: 0 });
 
   // ── 工具：HTML 转义 ──────────────────────────────────────────────
   function escHtml(s) {
@@ -167,6 +241,35 @@ function extractAndBuild() {
     if (size < 1024) return `${size} B`;
     if (size < 1024 * 1024) return `${(size / 1024).toFixed(1).replace(/\.0$/, '')} KB`;
     return `${(size / (1024 * 1024)).toFixed(1).replace(/\.0$/, '')} MB`;
+  }
+
+  function parseTimestampValue(rawValue) {
+    if (rawValue == null || rawValue === '') return null;
+    if (typeof rawValue === 'number') {
+      return rawValue < 1e12 ? new Date(rawValue * 1000) : new Date(rawValue);
+    }
+    if (typeof rawValue === 'string' && /^\d+(\.\d+)?$/.test(rawValue.trim())) {
+      const numeric = Number(rawValue);
+      return numeric < 1e12 ? new Date(numeric * 1000) : new Date(numeric);
+    }
+    const parsed = new Date(rawValue);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  function formatMessageTimestamp(msg) {
+    const candidates = [msg.stop_timestamp, msg.created_at, msg.updated_at];
+    let date = null;
+    for (const value of candidates) {
+      date = parseTimestampValue(value);
+      if (date) break;
+    }
+    if (!date) return '';
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const hours = String(date.getHours()).padStart(2, '0');
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+    return `${year}-${month}-${day} ${hours}:${minutes}`;
   }
 
   function guessMime(fileName, fileType) {
@@ -227,6 +330,51 @@ function extractAndBuild() {
     return `data:${mime};charset=utf-8,${encodeURIComponent(text)}`;
   }
 
+  async function fetchWithTimeout(resource, options = {}, timeoutMs = 8000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(resource, {
+        ...options,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function fetchWithRetry(resource, options = {}, config = {}) {
+    const retries = Number.isFinite(config.retries) ? config.retries : 2;
+    const timeoutMs = Number.isFinite(config.timeoutMs) ? config.timeoutMs : 8000;
+    const retryDelayMs = Number.isFinite(config.retryDelayMs) ? config.retryDelayMs : 450;
+    const shouldRetryResponse = typeof config.shouldRetryResponse === 'function'
+      ? config.shouldRetryResponse
+      : (response) => !response.ok && [408, 425, 429, 500, 502, 503, 504].includes(response.status);
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      try {
+        const response = await fetchWithTimeout(resource, options, timeoutMs);
+        if (shouldRetryResponse(response)) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        return response;
+      } catch (error) {
+        lastError = error;
+        if (attempt >= retries) break;
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs * (attempt + 1)));
+      }
+    }
+
+    throw lastError || new Error('unknown fetch error');
+  }
+
+  function formatFetchError(error) {
+    if (!error) return 'unknown error';
+    if (error.name === 'AbortError') return '请求超时（已重试）';
+    return error.message || String(error);
+  }
+
   async function fetchFileContent(att, orgUuid, chatUuid) {
     try {
       if (att.source === 'attachments' && att.extractedContent) {
@@ -234,7 +382,7 @@ function extractAndBuild() {
       }
 
       if (att.previewUrl) {
-        const resp = await fetch(att.previewUrl);
+        const resp = await fetchWithRetry(att.previewUrl);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const buf = await resp.arrayBuffer();
         if (!buf.byteLength) throw new Error('empty response');
@@ -256,7 +404,7 @@ function extractAndBuild() {
         }
 
         const url = `/api/organizations/${orgUuid}/conversations/${chatUuid}/wiggle/download-file?path=${encodeURIComponent(att.path)}`;
-        const resp = await fetch(url);
+        const resp = await fetchWithRetry(url);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         if (isTextMime(mime)) {
           return { text: await resp.text() };
@@ -268,7 +416,7 @@ function extractAndBuild() {
 
       return {};
     } catch (e) {
-      return { fetchError: e.message };
+      return { fetchError: formatFetchError(e) };
     }
   }
 
@@ -278,7 +426,7 @@ function extractAndBuild() {
       const url = new URL(rawUrl, location.href);
       if (url.origin !== location.origin) return null;
 
-      const resp = await fetch(url.href);
+      const resp = await fetchWithRetry(url.href);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 
       const buf = await resp.arrayBuffer();
@@ -567,6 +715,59 @@ function extractAndBuild() {
 </dialog>`;
   }
 
+  function makeAnchorId(prefix, raw, index) {
+    const slug = String(raw || prefix || 'section')
+      .toLowerCase()
+      .replace(/&quot;/g, '')
+      .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 64);
+    return `${prefix}-${slug || 'section'}-${index}`;
+  }
+
+  function isThinkingPart(part) {
+    const type = String(part && part.type || '').toLowerCase();
+    return type.includes('thinking');
+  }
+
+  function extractThinkingText(value, seen = new WeakSet()) {
+    if (value == null) return '';
+    if (typeof value === 'string') return value.trim();
+    if (typeof value !== 'object') return '';
+    if (seen.has(value)) return '';
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      const merged = value
+        .map((item) => extractThinkingText(item, seen))
+        .filter(Boolean);
+      return Array.from(new Set(merged)).join('\n\n').trim();
+    }
+
+    const fragments = [];
+    const keys = ['thinking', 'text', 'summary', 'content', 'parts', 'segments', 'items', 'messages', 'children', 'value'];
+    keys.forEach((key) => {
+      if (!(key in value)) return;
+      const fragment = extractThinkingText(value[key], seen);
+      if (fragment) fragments.push(fragment);
+    });
+
+    return Array.from(new Set(fragments)).join('\n\n').trim();
+  }
+
+  function renderThinkingBlock(text) {
+    const hasText = Boolean(text && text.trim());
+    const title = hasText ? '💭 思维链' : '💭 思维链（未公开具体内容）';
+    const body = hasText
+      ? `<div class="thinking-content md">${md2html(text)}</div>`
+      : `<div class="thinking-content"><p>当前对话数据只标记存在 thinking block，但没有暴露可读文本，所以这里先保留一个占位，避免被静默丢弃。</p></div>`;
+    return `
+<details class="thinking-block">
+  <summary>${title}</summary>
+  ${body}
+</details>`;
+  }
+
   // ── 工具：widget_code → 完整独立 srcdoc HTML ───────────────────
   function makeWidgetSrcdoc(widgetCode, iframeId) {
     const frameIdLiteral = JSON.stringify(String(iframeId || ''));
@@ -753,97 +954,132 @@ marker path { stroke: #7F77DD; fill: none; }
 
   // ── 提取数据 ────────────────────────────────────────────────────
   return (async () => {
-    const currentChatUuid = window.location.pathname.split('/').pop();
+    try {
+      const currentChatUuid = window.location.pathname.split('/').pop();
 
-    const qc = findQueryClient();
-    if (!qc) {
-      return { html: null, title: '', error: 'React Query Client 未找到，请确保页面已完整加载' };
-    }
-
-    const allQueries = qc.getQueryCache().getAll();
-    const treeQuery = allQueries.find(q =>
-      JSON.stringify(q.queryKey || '').includes(currentChatUuid)
-      && q.state.data && q.state.data.chat_messages
-    );
-
-    if (!treeQuery || !treeQuery.state.data) {
-      return { html: null, title: '', error: '对话数据未找到，请确保页面已完整加载' };
-    }
-
-    let orgUuid = '';
-    for (const q of allQueries) {
-      const key = JSON.stringify(q.queryKey || '');
-      const match = key.match(/"orgUuid":"([^"]+)"/);
-      if (match) {
-        orgUuid = match[1];
-        break;
+      const qc = findQueryClient();
+      if (!qc) {
+        return fail('React Query Client 未找到，请确保页面已完整加载');
       }
-    }
 
-    const convData  = treeQuery.state.data;
-    const chatTitle = convData.name || 'Claude Chat';
-    const chatMsgs  = (convData.chat_messages || []).sort((a, b) => (a.index || 0) - (b.index || 0));
+      const allQueries = qc.getQueryCache().getAll();
+      const treeQuery = allQueries.find(q =>
+        JSON.stringify(q.queryKey || '').includes(currentChatUuid)
+        && q.state.data && q.state.data.chat_messages
+      );
 
-    const attachmentEntries = [];
-    for (const msg of chatMsgs) {
-      if (msg.sender !== 'human') continue;
+      if (!treeQuery || !treeQuery.state.data) {
+        return fail('对话数据未找到，请确保页面已完整加载');
+      }
 
-      const messageKey = String(msg.uuid || msg.index || attachmentEntries.length)
-        .replace(/[^a-zA-Z0-9_-]/g, '-');
-
-      const rawAtts = [
-        ...(msg.attachments || []).map(a => ({
-          source: 'attachments',
-          name: a.file_name || '附件',
-          type: a.file_type || '',
-          kind: '',
-          size: a.file_size || 0,
-          uuid: a.file_uuid || '',
-          extractedContent: a.extracted_content || '',
-          path: null,
-          previewUrl: null,
-        })),
-        ...(msg.files || []).map(f => ({
-          source: 'files',
-          name: f.file_name || f.path || '附件',
-          type: f.file_kind || f.file_type || '',
-          kind: f.file_kind || '',
-          size: f.file_size || 0,
-          uuid: f.file_uuid || f.uuid || '',
-          extractedContent: '',
-          path: f.path || null,
-          previewUrl: f.preview_url || (f.preview_asset && f.preview_asset.url) || f.thumbnail_url || null,
-        })),
-      ];
-
-      const fetchedAtts = await Promise.all(rawAtts.map(async (att) => {
-        const fetched = await fetchFileContent(att, orgUuid, currentChatUuid);
-        if (typeof fetched.text === 'string' && isMarkdownLike(att.type || att.name)) {
-          return {
-            ...fetched,
-            text: await inlineTextAssetUrls(fetched.text),
-          };
+      let orgUuid = '';
+      for (const q of allQueries) {
+        const key = JSON.stringify(q.queryKey || '');
+        const match = key.match(/"orgUuid":"([^"]+)"/);
+        if (match) {
+          orgUuid = match[1];
+          break;
         }
-        return fetched;
-      }));
-      rawAtts.forEach((att, idx) => {
-        attachmentEntries.push({
-          ...att,
-          ...fetchedAtts[idx],
-          messageKey,
-          dialogId: `att-${messageKey}-${idx}`,
-        });
-      });
-    }
+      }
 
-    const attMap = {};
-    attachmentEntries.forEach(att => {
-      if (!attMap[att.messageKey]) attMap[att.messageKey] = [];
-      attMap[att.messageKey].push(att);
-    });
+      const convData  = treeQuery.state.data;
+      const chatTitle = convData.name || 'Claude Chat';
+      const chatMsgs  = (convData.chat_messages || []).sort((a, b) => (a.index || 0) - (b.index || 0));
+
+      const totalAttachments = chatMsgs.reduce((count, msg) => {
+        if (msg.sender !== 'human') return count;
+        return count + (msg.attachments || []).length + (msg.files || []).length;
+      }, 0);
+      let completedAttachments = 0;
+      if (totalAttachments > 0) {
+        setProgress({
+          state: 'running',
+          stage: 'attachments',
+          completed: 0,
+          total: totalAttachments,
+          message: `正在抓取附件内容… (0 / ${totalAttachments})`,
+        });
+      }
+
+      const attachmentEntries = [];
+      for (const msg of chatMsgs) {
+        if (msg.sender !== 'human') continue;
+
+        const messageKey = String(msg.uuid || msg.index || attachmentEntries.length)
+          .replace(/[^a-zA-Z0-9_-]/g, '-');
+
+        const rawAtts = [
+          ...(msg.attachments || []).map(a => ({
+            source: 'attachments',
+            name: a.file_name || '附件',
+            type: a.file_type || '',
+            kind: '',
+            size: a.file_size || 0,
+            uuid: a.file_uuid || '',
+            extractedContent: a.extracted_content || '',
+            path: null,
+            previewUrl: null,
+          })),
+          ...(msg.files || []).map(f => ({
+            source: 'files',
+            name: f.file_name || f.path || '附件',
+            type: f.file_kind || f.file_type || '',
+            kind: f.file_kind || '',
+            size: f.file_size || 0,
+            uuid: f.file_uuid || f.uuid || '',
+            extractedContent: '',
+            path: f.path || null,
+            previewUrl: f.preview_url || (f.preview_asset && f.preview_asset.url) || f.thumbnail_url || null,
+          })),
+        ];
+
+        const fetchedAtts = await Promise.all(rawAtts.map(async (att) => {
+          const fetched = await fetchFileContent(att, orgUuid, currentChatUuid);
+          completedAttachments += 1;
+          if (totalAttachments > 0) {
+            setProgress({
+              state: 'running',
+              stage: 'attachments',
+              completed: completedAttachments,
+              total: totalAttachments,
+              message: `正在抓取附件内容… (${completedAttachments} / ${totalAttachments})`,
+            });
+          }
+          if (typeof fetched.text === 'string' && isMarkdownLike(att.type || att.name)) {
+            return {
+              ...fetched,
+              text: await inlineTextAssetUrls(fetched.text),
+            };
+          }
+          return fetched;
+        }));
+        rawAtts.forEach((att, idx) => {
+          attachmentEntries.push({
+            ...att,
+            ...fetchedAtts[idx],
+            messageKey,
+            dialogId: `att-${messageKey}-${idx}`,
+          });
+        });
+      }
+
+      setProgress({
+        state: 'running',
+        stage: 'render',
+        completed: completedAttachments,
+        total: totalAttachments,
+        message: '正在构建离线 HTML…',
+      });
+
+      const attMap = {};
+      attachmentEntries.forEach(att => {
+        if (!attMap[att.messageKey]) attMap[att.messageKey] = [];
+        attMap[att.messageKey].push(att);
+      });
 
     // ── 构建对话 HTML ────────────────────────────────────────────────
     const turnsHtml = [];
+    const widgetTocItems = [];
 
     for (const msg of chatMsgs) {
       // 用户消息
@@ -858,6 +1094,7 @@ marker path { stroke: #7F77DD; fill: none; }
         const messageKey = String(msg.uuid || msg.index || turnsHtml.length)
           .replace(/[^a-zA-Z0-9_-]/g, '-');
         const attList = attMap[messageKey] || [];
+        const timeLabel = formatMessageTimestamp(msg);
 
         if (!textContent.trim() && attList.length === 0) continue;
 
@@ -873,6 +1110,7 @@ marker path { stroke: #7F77DD; fill: none; }
   <div class="bubble ub">
     ${attachHtml}
     <div class="md user-text">${md2html(textContent)}</div>
+    ${timeLabel ? `<div class="turn-time">${escHtml(timeLabel)}</div>` : ''}
     ${dialogHtml}
   </div>
 </div>`);
@@ -885,6 +1123,7 @@ marker path { stroke: #7F77DD; fill: none; }
         const parts = [];
         const messageKey = String(msg.uuid || msg.index || turnsHtml.length)
           .replace(/[^a-zA-Z0-9_-]/g, '-');
+        const timeLabel = formatMessageTimestamp(msg);
         let widgetIndex = 0;
         for (const c of msg.content) {
           // 正文文字（跳过空白和思维链）
@@ -892,27 +1131,40 @@ marker path { stroke: #7F77DD; fill: none; }
             const textHtml = md2html(await inlineTextAssetUrls(c.text));
             parts.push(`<div class="md">${textHtml}</div>`);
           }
+          if (isThinkingPart(c)) {
+            const thinkingText = await inlineTextAssetUrls(extractThinkingText(c));
+            parts.push(renderThinkingBlock(thinkingText));
+          }
           // 控件（show_widget）→ 内联为 srcdoc iframe
           if (
             c.type === 'tool_use' &&
             c.name && c.name.includes('show_widget') &&
             c.input && c.input.widget_code
           ) {
-            const iframeId = `widget-${messageKey}-${widgetIndex++}`;
+            const currentWidgetIndex = widgetIndex++;
+            const iframeId = `widget-${messageKey}-${currentWidgetIndex}`;
             const srcdoc = makeWidgetSrcdoc(c.input.widget_code, iframeId);
-            const wTitle = escHtml(c.input.title || 'widget');
+            const widgetTitle = c.input.title || 'widget';
+            const wTitle = escHtml(widgetTitle);
+            const widgetSectionId = makeAnchorId('widget', widgetTitle, widgetTocItems.length + 1);
+            widgetTocItems.push({
+              id: widgetSectionId,
+              title: widgetTitle,
+            });
             parts.push(`
-<div class="widget-wrapper">
-  <div class="widget-header">⚡ ${wTitle}</div>
-  <iframe srcdoc="${srcdoc}" sandbox="allow-scripts" class="widget-iframe" data-iframe-id="${iframeId}" loading="lazy" scrolling="no"></iframe>
-</div>`);
+<section id="${widgetSectionId}" class="widget-section">
+  <div class="widget-wrapper">
+    <div class="widget-header">⚡ ${wTitle}</div>
+    <iframe srcdoc="${srcdoc}" sandbox="allow-scripts" class="widget-iframe" data-iframe-id="${iframeId}" loading="lazy" scrolling="no"></iframe>
+  </div>
+</section>`);
           }
         }
         if (parts.length > 0) {
           turnsHtml.push(`
 <div class="turn claude-turn">
   <div class="avatar ca">C</div>
-  <div class="bubble cb">${parts.join('\n')}</div>
+  <div class="bubble cb">${parts.join('\n')}${timeLabel ? `\n<div class="turn-time">${escHtml(timeLabel)}</div>` : ''}</div>
 </div>`);
         }
         continue;
@@ -921,7 +1173,7 @@ marker path { stroke: #7F77DD; fill: none; }
 
   // ── 页面样式 ─────────────────────────────────────────────────────
   const PAGE_CSS = `
-*, ::before, *::after { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: border-box; }
 
 /* ── 全局 ── */
 body {
@@ -1046,6 +1298,15 @@ body {
 
 /* ── 用户文本 ── */
 .user-text { white-space: pre-wrap; word-break: break-word; }
+.turn-time {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #8b8680;
+  line-height: 1.3;
+}
+.user-turn .turn-time {
+  text-align: right;
+}
 
 /* ── Markdown 正文 ── */
 .md { font-size: 16px; }
@@ -1098,12 +1359,42 @@ body {
 .md tr:nth-child(even) { background: #faf8f4; }
 .md tr:hover { background: #f5f0ea; transition: background .1s; }
 
+/* ── Thinking 折叠块 ── */
+.thinking-block {
+  margin: 14px 0;
+  border: 1px dashed #d6d3d1;
+  border-radius: 12px;
+  background: #fcfaf6;
+}
+.thinking-block summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #7c4f10;
+  user-select: none;
+}
+.thinking-block summary::-webkit-details-marker { display: none; }
+.thinking-block[open] summary {
+  border-bottom: 1px solid #eee6d7;
+}
+.thinking-content {
+  padding: 12px 14px 14px;
+  color: #57534e;
+  font-size: 14px;
+}
+.thinking-content p:last-child {
+  margin-bottom: 0;
+}
+
 /* ── Widget ── */
 .widget-wrapper {
   margin: 16px 0; border: 1px solid #e8d5a3;
   border-radius: 12px; overflow: hidden; background: #fff;
   box-shadow: 0 1px 6px rgba(0,0,0,.05);
 }
+.widget-section { scroll-margin-top: 28px; }
 .widget-header {
   background: #fdf6e3; color: #7c4f10;
   padding: 7px 14px; font-size: 12px; font-weight: 600;
@@ -1123,6 +1414,92 @@ body {
   display: none;
 }
 
+/* ── 右侧目录 ── */
+.toc-panel {
+  display: none;
+}
+
+@media (min-width: 1380px) {
+  .toc-panel {
+    display: block;
+    position: fixed;
+    top: 88px;
+    right: 24px;
+    width: 220px;
+    max-height: calc(100vh - 120px);
+    overflow: auto;
+    padding: 14px 12px;
+    border: 1px solid #e8e4dc;
+    border-radius: 16px;
+    background: rgba(255,255,255,.92);
+    box-shadow: 0 10px 30px rgba(20,20,19,.08);
+    backdrop-filter: blur(10px);
+    z-index: 20;
+  }
+
+  .toc-title {
+    margin-bottom: 10px;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    color: #78716c;
+  }
+
+  .toc-nav {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .toc-link {
+    display: grid;
+    grid-template-columns: 22px minmax(0, 1fr);
+    gap: 8px;
+    align-items: start;
+    padding: 8px 10px;
+    border-radius: 12px;
+    color: #44403c;
+    text-decoration: none;
+    transition: background .15s ease, color .15s ease, transform .15s ease;
+  }
+
+  .toc-link:hover {
+    background: #f5f0ea;
+    color: #1c1917;
+    transform: translateX(-1px);
+  }
+
+  .toc-link.is-active {
+    background: #fdf6e3;
+    color: #7c4f10;
+  }
+
+  .toc-index {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 999px;
+    background: #f3ede4;
+    color: #7c6f60;
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  .toc-link.is-active .toc-index {
+    background: #f0d792;
+    color: #7c4f10;
+  }
+
+  .toc-text {
+    min-width: 0;
+    font-size: 12px;
+    line-height: 1.45;
+    word-break: break-word;
+  }
+}
+
 /* ── 打印优化 ── */
 @media print {
   body { background: #fff; font-size: 14px; padding: 0; }
@@ -1130,6 +1507,7 @@ body {
   .att-dialog { display: none; }
   .bubble { max-width: 100%; }
   .turn { page-break-inside: avoid; }
+  .toc-panel { display: none !important; }
 }
 
 /* ── 深色模式（系统自动） ── */
@@ -1138,15 +1516,27 @@ body {
   .chat-title { color: #f0ece4; border-bottom-color: #3a3830; }
   .claude-turn + .user-turn { border-top-color: #3a3830; }
   .ub { background: #2c2a26; color: #e8e4dc; }
+  .turn-time { color: #9b9489; }
   .md p code, .md li code { background: rgba(255,255,255,.1); color: #d4d0c8; border-color: rgba(255,255,255,.15); }
   .md blockquote { border-left-color: rgba(255,255,255,.2); color: #b5b0a8; }
   .md th { background: #2c2a26; color: #e8e4dc; }
   .md td { border-color: #3a3830; }
   .md tr:nth-child(even) { background: #222018; }
   .md tr:hover { background: #2c2a26; }
+  .thinking-block { background: #221f19; border-color: #3d3420; }
+  .thinking-block summary { color: #f4d38a; }
+  .thinking-block[open] summary { border-bottom-color: #3d3420; }
+  .thinking-content { color: #d6d3d1; }
   .widget-wrapper { border-color: #5a4a20; background: #1e1c18; }
   .widget-header { background: #2a2416; color: #d4a84b; border-bottom-color: #3d3420; }
   .widget-iframe { background: #fff; }
+  .toc-panel { background: rgba(30,28,24,.92); border-color: #3d3420; }
+  .toc-title { color: #b5b0a8; }
+  .toc-link { color: #d6d3d1; }
+  .toc-link:hover { background: #2c2a26; color: #f0ece4; }
+  .toc-link.is-active { background: #2a2416; color: #f4d38a; }
+  .toc-index { background: #38342f; color: #d6d3d1; }
+  .toc-link.is-active .toc-index { background: #5a4a20; color: #f4d38a; }
 }
 `;
 
@@ -1189,6 +1579,12 @@ function queuePageHeightPost() {
 }
 
 document.addEventListener('click', (event) => {
+  const tocLink = event.target.closest('.toc-link');
+  if (tocLink) {
+    document.querySelectorAll('.toc-link').forEach((link) => link.classList.remove('is-active'));
+    tocLink.classList.add('is-active');
+  }
+
   const openBtn = event.target.closest('.att-button');
   if (openBtn) {
     const dialog = document.getElementById(openBtn.dataset.target);
@@ -1233,6 +1629,38 @@ if (typeof ResizeObserver !== 'undefined') {
   }
 }
 
+if (typeof IntersectionObserver !== 'undefined') {
+  const tocLinks = Array.from(document.querySelectorAll('.toc-link'));
+  const sectionById = new Map(
+    tocLinks
+      .map((link) => {
+        const targetId = link.dataset.targetId || '';
+        return [targetId, document.getElementById(targetId)];
+      })
+      .filter(([, section]) => section)
+  );
+
+  if (sectionById.size > 0) {
+    const activateTocLink = (targetId) => {
+      tocLinks.forEach((link) => link.classList.toggle('is-active', link.dataset.targetId === targetId));
+    };
+
+    const observer = new IntersectionObserver((entries) => {
+      const visible = entries
+        .filter((entry) => entry.isIntersecting)
+        .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+      if (visible.length > 0) {
+        activateTocLink(visible[0].target.id);
+      }
+    }, {
+      rootMargin: '-18% 0px -70% 0px',
+      threshold: [0.1, 0.25, 0.5],
+    });
+
+    sectionById.forEach((section) => observer.observe(section));
+  }
+}
+
 window.addEventListener('load', () => {
   postPageHeight();
   setTimeout(postPageHeight, 100);
@@ -1244,7 +1672,21 @@ postPageHeight();
 `;
 
   // ── 组装完整 HTML ─────────────────────────────────────────────────
-  const fullHtml = `<!DOCTYPE html>
+      const tocHtml = widgetTocItems.length > 0
+        ? `
+  <aside class="toc-panel" aria-label="对话目录">
+    <div class="toc-title">目录</div>
+    <nav class="toc-nav">
+      ${widgetTocItems.map((item, index) => `
+      <a class="toc-link${index === 0 ? ' is-active' : ''}" href="#${escHtml(item.id)}" data-target-id="${escHtml(item.id)}">
+        <span class="toc-index">${index + 1}</span>
+        <span class="toc-text">${escHtml(item.title)}</span>
+      </a>`).join('')}
+    </nav>
+  </aside>`
+        : '';
+
+      const fullHtml = `<!DOCTYPE html>
 <html lang="zh">
 <head>
   <meta charset="UTF-8"/>
@@ -1253,6 +1695,7 @@ postPageHeight();
   <style>${PAGE_CSS}</style>
 </head>
 <body>
+  ${tocHtml}
   <div class="chat-container">
     <h1 class="chat-title">💬 ${escHtml(chatTitle)}</h1>
     ${turnsHtml.join('\n')}
@@ -1261,6 +1704,17 @@ postPageHeight();
 </body>
 </html>`;
 
-    return { html: fullHtml, title: chatTitle };
+      setProgress({
+        state: 'done',
+        stage: 'done',
+        completed: completedAttachments,
+        total: totalAttachments,
+        message: '✅ 导出成功！',
+      });
+      scheduleProgressCleanup();
+      return { html: fullHtml, title: chatTitle };
+    } catch (e) {
+      return fail(e && e.message ? e.message : String(e));
+    }
   })();
 }
