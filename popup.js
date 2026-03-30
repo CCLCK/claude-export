@@ -1,3 +1,77 @@
+function sanitizeBaseName(raw) {
+  const cleaned = String(raw || 'claude-chat')
+    .trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-')
+    .replace(/\s+/g, ' ')
+    .replace(/\.+$/g, '')
+    .slice(0, 120);
+  return cleaned || 'claude-chat';
+}
+
+function formatLocalDate(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function formatLocalTimestamp(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const seconds = String(date.getSeconds()).padStart(2, '0');
+  return `${year}${month}${day}-${hours}${minutes}${seconds}`;
+}
+
+function yamlQuoted(value) {
+  return `"${String(value || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')}"`;
+}
+
+function triggerDownload(content, fileName, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function buildObsidianMarkdown({ title, htmlFileName, sourceUrl }) {
+  const date = formatLocalDate();
+  const relativeHref = encodeURI(`./${htmlFileName}`);
+  return `---
+title: ${yamlQuoted(title || 'Claude Chat')}
+tags: [export, claude, visualization]
+date: ${date}
+source: ${yamlQuoted(sourceUrl || 'https://claude.ai')}
+html_export: ${yamlQuoted(htmlFileName)}
+---
+
+# ${title || 'Claude Chat'}
+
+> [!info]
+> 交互版 HTML 已和这篇索引笔记一同导出。
+> Obsidian 原生对本地 HTML iframe / script 的支持并不可靠，这篇笔记默认改为“索引 + 打开入口”，不再尝试在 Markdown 里硬嵌交互页。
+
+## 打开交互版
+
+- [[${htmlFileName}|打开交互版 HTML]]
+- [通过相对路径打开](${relativeHref})
+
+## 说明
+
+- 如果点击后在 Obsidian 内还是不显示，请直接在文件管理器或默认浏览器中打开 \`${htmlFileName}\`。
+- 这篇笔记的作用是检索、标签、双链和归档管理；真正的交互内容保存在同目录 HTML 附件里。
+`;
+}
+
 document.getElementById('exportBtn').addEventListener('click', async () => {
   const btn = document.getElementById('exportBtn');
   const status = document.getElementById('status');
@@ -30,15 +104,20 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
       return;
     }
 
-    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = (title || 'claude-chat') + '.html';
-    a.click();
-    URL.revokeObjectURL(url);
+    const baseName = sanitizeBaseName(`${formatLocalTimestamp()}-${title || 'claude-chat'}`);
+    const htmlFileName = `${baseName}.html`;
+    const mdFileName = `${baseName}.md`;
+    const md = buildObsidianMarkdown({
+      title: title || 'Claude Chat',
+      htmlFileName,
+      sourceUrl: tab.url,
+    });
 
-    status.textContent = '✅ 导出成功！';
+    triggerDownload(html, htmlFileName, 'text/html;charset=utf-8');
+    await new Promise(resolve => setTimeout(resolve, 150));
+    triggerDownload(md, mdFileName, 'text/markdown;charset=utf-8');
+
+    status.textContent = '✅ 已导出 HTML + Obsidian 模板';
     status.className = 'success';
   } catch (e) {
     status.textContent = '导出失败：' + e.message;
@@ -1072,6 +1151,43 @@ body {
 `;
 
   const PAGE_SCRIPT = `
+let pageHeightRaf = 0;
+
+function measurePageHeight() {
+  const body = document.body;
+  const root = document.documentElement;
+  const container = document.querySelector('.chat-container');
+  const bodyRect = body ? body.getBoundingClientRect() : { top: 0 };
+  const containerHeight = container
+    ? Math.ceil(container.getBoundingClientRect().bottom - bodyRect.top)
+    : 0;
+
+  return Math.max(
+    0,
+    root ? root.scrollHeight : 0,
+    root ? root.offsetHeight : 0,
+    body ? body.scrollHeight : 0,
+    body ? body.offsetHeight : 0,
+    containerHeight
+  );
+}
+
+function postPageHeight() {
+  if (window.parent === window) return;
+  window.parent.postMessage({
+    type: 'claude-export-page-height',
+    height: Math.max(200, measurePageHeight()),
+  }, '*');
+}
+
+function queuePageHeightPost() {
+  if (pageHeightRaf) return;
+  pageHeightRaf = requestAnimationFrame(() => {
+    pageHeightRaf = 0;
+    postPageHeight();
+  });
+}
+
 document.addEventListener('click', (event) => {
   const openBtn = event.target.closest('.att-button');
   if (openBtn) {
@@ -1104,7 +1220,27 @@ window.addEventListener('message', (event) => {
   const height = Number(data.height || 0);
   if (!Number.isFinite(height) || height <= 0) return;
   frame.style.height = Math.max(120, Math.ceil(height)) + 'px';
+  postPageHeight();
+  setTimeout(postPageHeight, 0);
 });
+
+if (typeof ResizeObserver !== 'undefined') {
+  const pageResizeObserver = new ResizeObserver(() => queuePageHeightPost());
+  if (document.body) pageResizeObserver.observe(document.body);
+  const container = document.querySelector('.chat-container');
+  if (container && container !== document.body) {
+    pageResizeObserver.observe(container);
+  }
+}
+
+window.addEventListener('load', () => {
+  postPageHeight();
+  setTimeout(postPageHeight, 100);
+  setTimeout(postPageHeight, 500);
+});
+window.addEventListener('resize', postPageHeight);
+document.addEventListener('readystatechange', postPageHeight);
+postPageHeight();
 `;
 
   // ── 组装完整 HTML ─────────────────────────────────────────────────
