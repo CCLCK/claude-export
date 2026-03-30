@@ -43,6 +43,36 @@ function triggerDownload(content, fileName, mime) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+const WIDGET_IMAGE_PRESET_KEY = 'claude-export-widget-image-preset';
+const DEFAULT_WIDGET_IMAGE_PRESET = '300dpi';
+
+function normalizeWidgetImagePreset(preset) {
+  const value = String(preset || '').toLowerCase();
+  if (value === '2x') {
+    return { id: '2x', label: '2x', scale: 2, dpi: 192 };
+  }
+  if (value === '600dpi') {
+    return { id: '600dpi', label: '600 DPI', scale: 6.25, dpi: 600 };
+  }
+  return { id: '300dpi', label: '300 DPI', scale: 3.125, dpi: 300 };
+}
+
+function loadWidgetImagePresetId() {
+  try {
+    return normalizeWidgetImagePreset(localStorage.getItem(WIDGET_IMAGE_PRESET_KEY)).id;
+  } catch (error) {
+    return DEFAULT_WIDGET_IMAGE_PRESET;
+  }
+}
+
+function saveWidgetImagePresetId(preset) {
+  try {
+    localStorage.setItem(WIDGET_IMAGE_PRESET_KEY, normalizeWidgetImagePreset(preset).id);
+  } catch (error) {
+    // Ignore popup-local persistence failures.
+  }
+}
+
 function readExportProgress(runId) {
   const key = String(runId || '');
   if (!key) return null;
@@ -110,9 +140,19 @@ ${promptSummarySection ? `${promptSummarySection}\n` : ''}## 说明
 `;
 }
 
+const widgetImagePresetSelect = document.getElementById('widgetImagePreset');
+if (widgetImagePresetSelect) {
+  widgetImagePresetSelect.value = loadWidgetImagePresetId();
+  widgetImagePresetSelect.addEventListener('change', () => {
+    saveWidgetImagePresetId(widgetImagePresetSelect.value);
+  });
+}
+
 document.getElementById('exportBtn').addEventListener('click', async () => {
   const btn = document.getElementById('exportBtn');
   const includeThinking = Boolean(document.getElementById('includeThinking')?.checked);
+  const widgetImageExport = normalizeWidgetImagePreset(widgetImagePresetSelect?.value || DEFAULT_WIDGET_IMAGE_PRESET);
+  saveWidgetImagePresetId(widgetImageExport.id);
   const status = document.getElementById('status');
   btn.disabled = true;
   status.className = '';
@@ -165,7 +205,7 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
     const exportPromise = chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: extractAndBuild,
-      args: [runId, { includeThinking }],
+      args: [runId, { includeThinking, widgetImageExport }],
       world: 'MAIN'
     });
     pollTimer = setInterval(() => {
@@ -218,6 +258,20 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
 function extractAndBuild(runId, options) {
   const exportRunId = String(runId || `claude-export-${Date.now()}`);
   const includeThinking = Boolean(options && options.includeThinking);
+  const normalizeWidgetImageExport = (value) => {
+    const preset = value && typeof value === 'object' ? value : {};
+    const scale = Number(preset.scale);
+    const dpi = Number(preset.dpi);
+    const id = String((preset && preset.id) || '').toLowerCase();
+    if (id === '2x' || Math.abs(scale - 2) < 0.001) {
+      return { id: '2x', label: '2x', scale: 2, dpi: 192 };
+    }
+    if (id === '600dpi' || Math.abs(dpi - 600) < 0.001) {
+      return { id: '600dpi', label: '600 DPI', scale: 6.25, dpi: 600 };
+    }
+    return { id: '300dpi', label: '300 DPI', scale: 3.125, dpi: 300 };
+  };
+  const widgetImageExport = normalizeWidgetImageExport(options && options.widgetImageExport);
   const progressStore = window.__CLAUDE_EXPORT_RUNS || (window.__CLAUDE_EXPORT_RUNS = {});
   const setProgress = (patch) => {
     progressStore[exportRunId] = {
@@ -674,8 +728,14 @@ function extractAndBuild(runId, options) {
 
   function renderAttachmentDialog(att, dialogId) {
     const mime = guessMime(att.name, att.type);
-    const textDataUrl = typeof att.text === 'string' ? textToDataUrl(att.text, mime) : '';
+    const hasTextContent = typeof att.text === 'string';
+    const canCopyAsText = hasTextContent && (isTextMime(mime) || isMarkdownLike(att.type || att.name));
+    const textDownloadMime = isMarkdownLike(att.type || att.name)
+      ? 'text/markdown;charset=utf-8'
+      : 'text/plain;charset=utf-8';
+    const textDataUrl = canCopyAsText ? textToDataUrl(att.text, textDownloadMime) : '';
     const downloadHref = att.dataUrl || textDataUrl;
+    const copySourceId = `${dialogId}-copy-source`;
     const chips = [
       att.type ? `类型：${escHtml(att.type)}` : '',
       att.size ? `大小：${escHtml(formatFileSize(att.size))}` : '',
@@ -722,16 +782,20 @@ function extractAndBuild(runId, options) {
   <a class="att-dl-btn" href="${escHtml(att.dataUrl)}" download="${escHtml(att.name)}">⬇️ 下载文件</a>
 </div>`;
       }
-    } else if (typeof att.text === 'string') {
+    } else if (hasTextContent) {
       if (isMarkdownLike(att.type || att.name)) {
         previewHtml = `<div class="attachment-preview md">${md2html(att.text)}</div>`;
       } else {
         previewHtml = `<pre class="attachment-preview attachment-pre">${escHtml(att.text)}</pre>`;
       }
-      if (downloadHref) {
+      if (canCopyAsText) {
         previewHtml += `
+<textarea id="${copySourceId}" class="att-copy-source" aria-hidden="true" tabindex="-1">${escHtml(att.text)}</textarea>
 <div class="att-actions">
-  <a class="att-dl-btn" href="${escHtml(downloadHref)}" download="${escHtml(att.name)}">⬇️ 下载文本</a>
+  ${downloadHref
+    ? `<a class="att-dl-btn" href="${escHtml(downloadHref)}" download="${escHtml(att.name)}">⬇️ 下载文本</a>`
+    : ''}
+  <button type="button" class="att-dl-btn att-copy-btn" data-copy-source-id="${copySourceId}">📋 复制文本</button>
 </div>`;
       }
     } else {
@@ -761,12 +825,46 @@ function extractAndBuild(runId, options) {
     return `${prefix}-${slug || 'section'}-${index}`;
   }
 
+  function copyIconSvg() {
+    return `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="9" y="9" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"></rect><rect x="4" y="4" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"></rect></svg>`;
+  }
+
+  function moreIconSvg() {
+    return `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="6.5" cy="12" r="1.7" fill="currentColor"></circle><circle cx="12" cy="12" r="1.7" fill="currentColor"></circle><circle cx="17.5" cy="12" r="1.7" fill="currentColor"></circle></svg>`;
+  }
+
+  function downloadIconSvg() {
+    return `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 4v9" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"></path><path d="m8.5 10.5 3.5 3.5 3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path><path d="M5 18.5h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"></path></svg>`;
+  }
+
+  function checkIconSvg() {
+    return `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m5 12.5 4.2 4.2L19 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>`;
+  }
+
   function summarizePromptLabel(text, index) {
     const compact = String(text || '')
       .replace(/\s+/g, ' ')
       .trim();
     if (!compact) return `问题 ${index}`;
     return compact.length > 28 ? `${compact.slice(0, 28)}…` : compact;
+  }
+
+  function joinMarkdownParts(parts) {
+    const blocks = Array.isArray(parts)
+      ? parts.filter((part) => typeof part === 'string' && part.length > 0)
+      : [];
+    let combined = '';
+    for (const block of blocks) {
+      if (!combined) {
+        combined = block;
+        continue;
+      }
+      const prevEndsWithWhitespace = /[\s\n]$/.test(combined);
+      const nextStartsWithWhitespace = /^[\s\n]/.test(block);
+      combined += (prevEndsWithWhitespace || nextStartsWithWhitespace) ? '' : '\n\n';
+      combined += block;
+    }
+    return combined;
   }
 
   function isThinkingPart(part) {
@@ -813,11 +911,125 @@ function extractAndBuild(runId, options) {
   }
 
   // ── 工具：widget_code → 完整独立 srcdoc HTML ───────────────────
-  function makeWidgetSrcdoc(widgetCode, iframeId) {
+  function makeWidgetSrcdoc(widgetCode, iframeId, imageExport) {
     const frameIdLiteral = JSON.stringify(String(iframeId || ''));
+    const exportScaleLiteral = JSON.stringify(Number(imageExport && imageExport.scale) || 3.125);
+    const exportDpiLiteral = JSON.stringify(Number(imageExport && imageExport.dpi) || 300);
     const resizeScript = `<script>
 (() => {
   const frameId = ${frameIdLiteral};
+  const defaultCaptureScale = ${exportScaleLiteral};
+  const defaultCaptureDpi = ${exportDpiLiteral};
+  const crcTable = (() => {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i += 1) {
+      let c = i;
+      for (let j = 0; j < 8; j += 1) {
+        c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      }
+      table[i] = c >>> 0;
+    }
+    return table;
+  })();
+  const collectStyleText = () => Array.from(document.querySelectorAll('style'))
+    .map((node) => node.textContent || '')
+    .join('\\n');
+  const readUint32 = (bytes, offset) => (
+    (((bytes[offset] << 24) >>> 0) |
+    ((bytes[offset + 1] << 16) >>> 0) |
+    ((bytes[offset + 2] << 8) >>> 0) |
+    (bytes[offset + 3] >>> 0)) >>> 0
+  );
+  const writeUint32 = (bytes, offset, value) => {
+    bytes[offset] = (value >>> 24) & 255;
+    bytes[offset + 1] = (value >>> 16) & 255;
+    bytes[offset + 2] = (value >>> 8) & 255;
+    bytes[offset + 3] = value & 255;
+  };
+  const asciiBytes = (text) => Uint8Array.from(Array.from(text).map((char) => char.charCodeAt(0)));
+  const concatUint8Arrays = (arrays) => {
+    const total = arrays.reduce((sum, array) => sum + array.length, 0);
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    arrays.forEach((array) => {
+      merged.set(array, offset);
+      offset += array.length;
+    });
+    return merged;
+  };
+  const crc32 = (bytes) => {
+    let crc = 0xffffffff;
+    for (let i = 0; i < bytes.length; i += 1) {
+      crc = crcTable[(crc ^ bytes[i]) & 255] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  };
+  const makePngChunk = (type, data) => {
+    const typeBytes = asciiBytes(type);
+    const chunk = new Uint8Array(12 + data.length);
+    writeUint32(chunk, 0, data.length);
+    chunk.set(typeBytes, 4);
+    chunk.set(data, 8);
+    const crcInput = new Uint8Array(typeBytes.length + data.length);
+    crcInput.set(typeBytes, 0);
+    crcInput.set(data, typeBytes.length);
+    writeUint32(chunk, 8 + data.length, crc32(crcInput));
+    return chunk;
+  };
+  const makePhysChunk = (dpi) => {
+    const pixelsPerMeter = Math.max(1, Math.round(Number(dpi || defaultCaptureDpi) / 0.0254));
+    const data = new Uint8Array(9);
+    writeUint32(data, 0, pixelsPerMeter);
+    writeUint32(data, 4, pixelsPerMeter);
+    data[8] = 1;
+    return makePngChunk('pHYs', data);
+  };
+  const dataUrlToBytes = (dataUrl) => {
+    const base64 = String(dataUrl || '').split(',')[1] || '';
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  };
+  const bytesToDataUrl = (bytes) => {
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 0x8000)));
+    }
+    return 'data:image/png;base64,' + btoa(binary);
+  };
+  const applyPngDpi = (dataUrl, dpi) => {
+    if (!String(dataUrl || '').startsWith('data:image/png')) return dataUrl;
+    const pngBytes = dataUrlToBytes(dataUrl);
+    if (pngBytes.length < 8) return dataUrl;
+    const signature = pngBytes.slice(0, 8);
+    const chunks = [];
+    let offset = 8;
+    let inserted = false;
+    while (offset + 12 <= pngBytes.length) {
+      const length = readUint32(pngBytes, offset);
+      const end = offset + 12 + length;
+      if (end > pngBytes.length) break;
+      const type = String.fromCharCode(
+        pngBytes[offset + 4],
+        pngBytes[offset + 5],
+        pngBytes[offset + 6],
+        pngBytes[offset + 7]
+      );
+      if (type !== 'pHYs') {
+        chunks.push(pngBytes.slice(offset, end));
+        if (!inserted && type === 'IHDR') {
+          chunks.push(makePhysChunk(dpi));
+          inserted = true;
+        }
+      }
+      offset = end;
+    }
+    if (!inserted) chunks.push(makePhysChunk(dpi));
+    return bytesToDataUrl(concatUint8Arrays([signature].concat(chunks)));
+  };
   const measureContentHeight = () => {
     const body = document.body;
     if (!body) return 120;
@@ -857,6 +1069,116 @@ function extractAndBuild(runId, options) {
   const postHeight = () => {
     parent.postMessage({ type: 'claude-export-widget-height', frameId, height: measureContentHeight() }, '*');
   };
+  const drawDataUrlToCanvas = (dataUrl, width, height, scale, dpi) => new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const captureScale = Math.max(1, Number(scale || defaultCaptureScale) || defaultCaptureScale);
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.ceil(width * captureScale));
+        canvas.height = Math.max(1, Math.ceil(height * captureScale));
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = getComputedStyle(document.body).backgroundColor || '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(applyPngDpi(canvas.toDataURL('image/png'), dpi || defaultCaptureDpi));
+      } catch (error) {
+        reject(error);
+      }
+    };
+    img.onerror = () => reject(new Error('image-render-failed'));
+    img.src = dataUrl;
+  });
+  const svgNodeToPngDataUrl = async (svgNode, scale, dpi) => {
+    const rect = svgNode.getBoundingClientRect();
+    const exportWidth = Math.max(1, Math.ceil(rect.width || document.documentElement.scrollWidth || 1));
+    const exportHeight = Math.max(1, Math.ceil(rect.height || measureContentHeight() || 1));
+    const captureScale = Math.max(1, Number(scale || defaultCaptureScale) || defaultCaptureScale);
+    const clone = svgNode.cloneNode(true);
+    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink');
+    if (!clone.getAttribute('width')) clone.setAttribute('width', String(exportWidth));
+    if (!clone.getAttribute('height')) clone.setAttribute('height', String(exportHeight));
+    if (!clone.getAttribute('viewBox')) clone.setAttribute('viewBox', '0 0 ' + exportWidth + ' ' + exportHeight);
+    const styleText = collectStyleText();
+    if (styleText) {
+      const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+      const style = document.createElementNS('http://www.w3.org/2000/svg', 'style');
+      style.textContent = styleText;
+      defs.appendChild(style);
+      clone.insertBefore(defs, clone.firstChild);
+    }
+    const serialized = new XMLSerializer().serializeToString(clone);
+    const svgDataUrl = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(serialized);
+    return {
+      dataUrl: await drawDataUrlToCanvas(svgDataUrl, exportWidth, exportHeight, captureScale, dpi),
+      width: Math.max(1, Math.ceil(exportWidth * captureScale)),
+      height: Math.max(1, Math.ceil(exportHeight * captureScale)),
+    };
+  };
+  const htmlToPngDataUrl = async (scale, dpi) => {
+    const body = document.body;
+    const exportWidth = Math.max(
+      1,
+      Math.ceil(document.documentElement.scrollWidth || body.scrollWidth || body.getBoundingClientRect().width || 1)
+    );
+    const exportHeight = Math.max(1, measureContentHeight());
+    const captureScale = Math.max(1, Number(scale || defaultCaptureScale) || defaultCaptureScale);
+    const bodyClone = body.cloneNode(true);
+    bodyClone.querySelectorAll('script').forEach((node) => node.remove());
+    const styleText = collectStyleText();
+    const bodyBackground = getComputedStyle(body).backgroundColor || '#ffffff';
+    const foreignObjectMarkup =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="' + exportWidth + '" height="' + exportHeight +
+      '" viewBox="0 0 ' + exportWidth + ' ' + exportHeight + '">' +
+      '<foreignObject width="100%" height="100%">' +
+      '<div xmlns="http://www.w3.org/1999/xhtml" style="width:' + exportWidth + 'px;height:' + exportHeight +
+      'px;background:' + bodyBackground + ';">' +
+      '<style>' + styleText + '</style>' +
+      bodyClone.innerHTML +
+      '</div>' +
+      '</foreignObject>' +
+      '</svg>';
+    const svgDataUrl = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(foreignObjectMarkup);
+    return {
+      dataUrl: await drawDataUrlToCanvas(svgDataUrl, exportWidth, exportHeight, captureScale, dpi),
+      width: Math.max(1, Math.ceil(exportWidth * captureScale)),
+      height: Math.max(1, Math.ceil(exportHeight * captureScale)),
+    };
+  };
+  const captureWidgetImage = async (scale, dpi) => {
+    const primarySvg = document.body.querySelector('svg');
+    if (primarySvg) {
+      try {
+        return await svgNodeToPngDataUrl(primarySvg, scale, dpi);
+      } catch (error) {
+        // Fall back to HTML capture below.
+      }
+    }
+    return htmlToPngDataUrl(scale, dpi);
+  };
+  const respondWidgetCapture = async (requestId, scale, dpi) => {
+    try {
+      const capture = await captureWidgetImage(scale, dpi);
+      parent.postMessage({
+        type: 'claude-export-widget-capture-result',
+        frameId,
+        requestId,
+        ok: true,
+        dataUrl: capture.dataUrl,
+        width: capture.width,
+        height: capture.height,
+      }, '*');
+    } catch (error) {
+      parent.postMessage({
+        type: 'claude-export-widget-capture-result',
+        frameId,
+        requestId,
+        ok: false,
+        error: error && error.message ? error.message : String(error),
+      }, '*');
+    }
+  };
   if (document.body && typeof ResizeObserver !== 'undefined') {
     new ResizeObserver(() => requestAnimationFrame(postHeight)).observe(document.body);
   }
@@ -867,6 +1189,16 @@ function extractAndBuild(runId, options) {
   });
   window.addEventListener('resize', postHeight);
   document.addEventListener('readystatechange', postHeight);
+  window.addEventListener('message', (event) => {
+    const data = event.data || {};
+    if (data.type !== 'claude-export-widget-capture-request') return;
+    if (data.frameId && data.frameId !== frameId) return;
+    respondWidgetCapture(
+      data.requestId || (frameId + '-' + Date.now()),
+      data.captureScale || defaultCaptureScale,
+      data.captureDpi || defaultCaptureDpi
+    );
+  });
 })();
 <\/script>`;
     const inner = `<!DOCTYPE html>
@@ -1180,6 +1512,7 @@ marker path { stroke: #7F77DD; fill: none; }
       if (msg.sender === 'assistant') {
         if (!Array.isArray(msg.content)) continue;
         const parts = [];
+        const assistantCopyParts = [];
         const messageKey = String(msg.uuid || msg.index || turnsHtml.length)
           .replace(/[^a-zA-Z0-9_-]/g, '-');
         const timeLabel = formatMessageTimestamp(msg);
@@ -1187,6 +1520,7 @@ marker path { stroke: #7F77DD; fill: none; }
         for (const c of msg.content) {
           // 正文文字（跳过空白和思维链）
           if (c.type === 'text' && c.text && c.text.trim()) {
+            assistantCopyParts.push(c.text);
             const textHtml = md2html(await inlineTextAssetUrls(c.text));
             parts.push(`<div class="md">${textHtml}</div>`);
           }
@@ -1202,7 +1536,7 @@ marker path { stroke: #7F77DD; fill: none; }
           ) {
             const currentWidgetIndex = widgetIndex++;
             const iframeId = `widget-${messageKey}-${currentWidgetIndex}`;
-            const srcdoc = makeWidgetSrcdoc(c.input.widget_code, iframeId);
+            const srcdoc = makeWidgetSrcdoc(c.input.widget_code, iframeId, widgetImageExport);
             const widgetTitle = c.input.title || 'widget';
             const wTitle = escHtml(widgetTitle);
             const widgetSectionId = makeAnchorId('widget', widgetTitle, widgetTocItems.length + 1);
@@ -1213,6 +1547,37 @@ marker path { stroke: #7F77DD; fill: none; }
             parts.push(`
 <section id="${widgetSectionId}" class="widget-section">
   <div class="widget-wrapper">
+    <div class="widget-toolbar">
+      <button
+        type="button"
+        class="widget-menu-toggle"
+        data-widget-menu-toggle="${iframeId}"
+        aria-label="控件图片操作"
+        title="控件图片操作"
+      >${moreIconSvg()}</button>
+      <div class="widget-menu" data-widget-menu="${iframeId}" hidden>
+        <button
+          type="button"
+          class="widget-menu-item"
+          data-widget-action="copy-image"
+          data-iframe-id="${iframeId}"
+          data-widget-title="${wTitle}"
+          data-default-html="${escHtml(copyIconSvg() + '<span>复制控件图片</span>')}"
+          data-success-html="${escHtml(checkIconSvg() + '<span>已复制</span>')}"
+          data-failure-html="${escHtml('<span>复制失败</span>')}"
+        >${copyIconSvg()}<span>复制控件图片</span></button>
+        <button
+          type="button"
+          class="widget-menu-item"
+          data-widget-action="download-image"
+          data-iframe-id="${iframeId}"
+          data-widget-title="${wTitle}"
+          data-default-html="${escHtml(downloadIconSvg() + '<span>下载控件图片</span>')}"
+          data-success-html="${escHtml(checkIconSvg() + '<span>已开始下载</span>')}"
+          data-failure-html="${escHtml('<span>下载失败</span>')}"
+        >${downloadIconSvg()}<span>下载控件图片</span></button>
+      </div>
+    </div>
     <div class="widget-header">⚡ ${wTitle}</div>
     <iframe srcdoc="${srcdoc}" sandbox="allow-scripts" class="widget-iframe" data-iframe-id="${iframeId}" loading="lazy" scrolling="no"></iframe>
   </div>
@@ -1220,10 +1585,35 @@ marker path { stroke: #7F77DD; fill: none; }
           }
         }
         if (parts.length > 0) {
+          const assistantCopyText = joinMarkdownParts(assistantCopyParts);
+          const replyCopyId = `reply-copy-${messageKey}`;
+          const replyActionHtml = assistantCopyText
+            ? `
+<div class="turn-actions turn-actions--assistant">
+  <textarea id="${replyCopyId}" class="copy-source" aria-hidden="true" tabindex="-1">${escHtml(assistantCopyText)}</textarea>
+  <button
+    type="button"
+    class="turn-icon-btn turn-copy-btn"
+    data-copy-source-id="${replyCopyId}"
+    data-default-html="${escHtml(copyIconSvg())}"
+    data-success-html="${escHtml(checkIconSvg())}"
+    data-failure-html="${escHtml('<span class=\"turn-copy-failure\">!</span>')}"
+    aria-label="复制回复文本"
+    title="复制回复文本"
+  >${copyIconSvg()}</button>
+</div>`
+            : '';
+          const assistantMetaHtml = (timeLabel || replyActionHtml)
+            ? `
+<div class="turn-meta turn-meta--assistant">
+  ${timeLabel ? `<div class="turn-time">${escHtml(timeLabel)}</div>` : ''}
+  ${replyActionHtml}
+</div>`
+            : '';
           turnsHtml.push(`
 <div class="turn claude-turn">
   <div class="avatar ca">C</div>
-  <div class="bubble cb">${parts.join('\n')}${timeLabel ? `\n<div class="turn-time">${escHtml(timeLabel)}</div>` : ''}</div>
+  <div class="bubble cb">${parts.join('\n')}${assistantMetaHtml}</div>
 </div>`);
         }
         continue;
@@ -1299,6 +1689,9 @@ body {
   padding: 0 4px;
   max-width: 100%;
 }
+.claude-turn .bubble.cb {
+  position: relative;
+}
 
 /* ── 附件 ── */
 .attachments { margin-bottom: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
@@ -1341,6 +1734,22 @@ body {
   font-size: 13px; font-weight: 600;
 }
 .att-dl-btn:hover { background: #ffedd5; }
+.att-copy-btn {
+  cursor: pointer;
+  background: #eef2ff;
+  color: #4338ca;
+}
+.att-copy-btn:hover { background: #e0e7ff; }
+.copy-source,
+.att-copy-source {
+  position: absolute;
+  left: -99999px;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
 .attachment-pre {
   margin: 0 16px 16px; padding: 14px 16px;
   border: 1px solid #e5e7eb; border-radius: 10px;
@@ -1362,6 +1771,56 @@ body {
   font-size: 12px;
   color: #8b8680;
   line-height: 1.3;
+}
+.turn-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.turn-meta--assistant {
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+.turn-meta--assistant .turn-time {
+  margin-top: 0;
+}
+.turn-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.turn-actions--assistant {
+  margin-top: 0;
+}
+.turn-icon-btn {
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  color: #7c7468;
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease, transform .15s ease;
+}
+.turn-icon-btn:hover {
+  background: #f2ede6;
+  color: #433f39;
+  transform: translateY(-1px);
+}
+.turn-icon-btn svg,
+.widget-menu-toggle svg,
+.widget-menu-item svg {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+.turn-copy-failure {
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1;
 }
 .user-turn .turn-time {
   text-align: right;
@@ -1450,14 +1909,76 @@ body {
 
 /* ── Widget ── */
 .widget-wrapper {
+  position: relative;
   margin: 16px 0; border: 1px solid #e8d5a3;
   border-radius: 12px; overflow: hidden; background: #fff;
   box-shadow: 0 1px 6px rgba(0,0,0,.05);
 }
 .widget-section { scroll-margin-top: 28px; }
+.widget-toolbar {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 3;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .16s ease;
+}
+.widget-wrapper:hover .widget-toolbar,
+.widget-wrapper:focus-within .widget-toolbar,
+.widget-toolbar.is-open {
+  opacity: 1;
+  pointer-events: auto;
+}
+.widget-menu-toggle {
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 10px;
+  background: rgba(255,255,255,.96);
+  color: #7c4f10;
+  box-shadow: 0 4px 14px rgba(20,20,19,.10);
+  cursor: pointer;
+}
+.widget-menu-toggle:hover {
+  background: #ffffff;
+}
+.widget-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 164px;
+  padding: 8px;
+  border: 1px solid #e8e4dc;
+  border-radius: 14px;
+  background: rgba(255,255,255,.98);
+  box-shadow: 0 14px 34px rgba(20,20,19,.16);
+}
+.widget-menu[hidden] { display: none; }
+.widget-menu-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  color: #3f3b35;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+}
+.widget-menu-item:hover {
+  background: #f8f3ea;
+}
 .widget-header {
   background: #fdf6e3; color: #7c4f10;
-  padding: 7px 14px; font-size: 12px; font-weight: 600;
+  padding: 7px 48px 7px 14px; font-size: 12px; font-weight: 600;
   border-bottom: 1px solid #f0e4b8; letter-spacing: 0.2px;
 }
 .widget-iframe {
@@ -1611,6 +2132,17 @@ body {
   .thinking-block[open] summary { border-bottom-color: #3d3420; }
   .thinking-content { color: #d6d3d1; }
   .widget-wrapper { border-color: #5a4a20; background: #1e1c18; }
+  .widget-menu-toggle {
+    background: rgba(30,28,24,.95);
+    color: #f4d38a;
+    box-shadow: 0 8px 18px rgba(0,0,0,.35);
+  }
+  .widget-menu {
+    background: rgba(30,28,24,.98);
+    border-color: #3d3420;
+  }
+  .widget-menu-item { color: #f0ece4; }
+  .widget-menu-item:hover { background: #2c2a26; }
   .widget-header { background: #2a2416; color: #d4a84b; border-bottom-color: #3d3420; }
   .widget-iframe { background: #fff; }
   .toc-panel { background: rgba(30,28,24,.92); border-color: #3d3420; }
@@ -1620,11 +2152,26 @@ body {
   .toc-link.is-active { background: #2a2416; color: #f4d38a; }
   .toc-index { background: #38342f; color: #d6d3d1; }
   .toc-link.is-active .toc-index { background: #5a4a20; color: #f4d38a; }
+  .turn-icon-btn { color: #b5b0a8; }
+  .turn-icon-btn:hover { background: #2c2a26; color: #f0ece4; }
 }
 `;
 
+  const widgetImageExportLiteral = JSON.stringify(widgetImageExport);
   const PAGE_SCRIPT = `
 let pageHeightRaf = 0;
+const widgetCaptureRequests = new Map();
+const widgetImageExport = ${widgetImageExportLiteral};
+
+function sanitizeExportName(raw) {
+  const cleaned = String(raw || 'widget')
+    .trim()
+    .replace(/[<>:"/\\\\|?*\\u0000-\\u001f]/g, '-')
+    .replace(/\\s+/g, ' ')
+    .replace(/\\.+$/g, '')
+    .slice(0, 80);
+  return cleaned || 'widget';
+}
 
 function measurePageHeight() {
   const body = document.body;
@@ -1661,6 +2208,151 @@ function queuePageHeightPost() {
   });
 }
 
+function setTransientButtonContent(trigger, nextHtml, stateClass) {
+  if (!trigger) return;
+  const originalHtml = trigger.dataset.restoreHtml || trigger.innerHTML;
+  trigger.dataset.restoreHtml = originalHtml;
+  if (trigger.__restoreTimer) clearTimeout(trigger.__restoreTimer);
+  trigger.classList.remove('is-success', 'is-error');
+  if (stateClass) trigger.classList.add(stateClass);
+  trigger.innerHTML = nextHtml;
+  trigger.__restoreTimer = setTimeout(() => {
+    trigger.innerHTML = originalHtml;
+    trigger.classList.remove('is-success', 'is-error');
+  }, 1600);
+}
+
+async function copyTextContent(text, trigger) {
+  if (!text) return false;
+
+  let copied = false;
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function' && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    } catch (error) {
+      copied = false;
+    }
+  }
+
+  if (!copied) {
+    const helper = document.createElement('textarea');
+    helper.value = text;
+    helper.setAttribute('readonly', '');
+    helper.style.position = 'fixed';
+    helper.style.opacity = '0';
+    helper.style.pointerEvents = 'none';
+    document.body.appendChild(helper);
+    helper.focus();
+    helper.select();
+    helper.setSelectionRange(0, helper.value.length);
+    try {
+      copied = document.execCommand('copy');
+    } catch (error) {
+      copied = false;
+    }
+    helper.remove();
+  }
+
+  if (trigger) {
+    setTransientButtonContent(
+      trigger,
+      copied
+        ? (trigger.dataset.successHtml || '✅ 已复制')
+        : (trigger.dataset.failureHtml || '复制失败'),
+      copied ? 'is-success' : 'is-error'
+    );
+  }
+
+  return copied;
+}
+
+async function copyAttachmentText(sourceId, trigger) {
+  const source = document.getElementById(sourceId);
+  const text = source && typeof source.value === 'string' ? source.value : '';
+  return copyTextContent(text, trigger);
+}
+
+function findWidgetFrame(frameId) {
+  return Array.from(document.querySelectorAll('.widget-iframe')).find((el) => el.dataset.iframeId === frameId) || null;
+}
+
+function closeWidgetMenus(exceptFrameId = '') {
+  document.querySelectorAll('.widget-menu').forEach((menu) => {
+    const frameId = menu.dataset.widgetMenu || '';
+    const keepOpen = exceptFrameId && frameId === exceptFrameId;
+    menu.hidden = !keepOpen;
+    menu.closest('.widget-toolbar')?.classList.toggle('is-open', keepOpen);
+  });
+}
+
+function requestWidgetCapture(frameId) {
+  const frame = findWidgetFrame(frameId);
+  if (!frame || !frame.contentWindow) {
+    return Promise.reject(new Error('widget-frame-missing'));
+  }
+
+  return new Promise((resolve, reject) => {
+    const requestId = frameId + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    const timeoutId = setTimeout(() => {
+      widgetCaptureRequests.delete(requestId);
+      reject(new Error('widget-capture-timeout'));
+    }, 12000);
+
+    widgetCaptureRequests.set(requestId, { resolve, reject, timeoutId });
+    frame.contentWindow.postMessage({
+      type: 'claude-export-widget-capture-request',
+      frameId,
+      requestId,
+      captureScale: widgetImageExport && widgetImageExport.scale,
+      captureDpi: widgetImageExport && widgetImageExport.dpi,
+    }, '*');
+  });
+}
+
+async function dataUrlToBlob(dataUrl) {
+  const response = await fetch(dataUrl);
+  return response.blob();
+}
+
+function downloadDataUrl(dataUrl, fileName) {
+  const link = document.createElement('a');
+  link.href = dataUrl;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+async function copyWidgetImage(frameId, widgetTitle, trigger) {
+  try {
+    const capture = await requestWidgetCapture(frameId);
+    const blob = await dataUrlToBlob(capture.dataUrl);
+    if (!navigator.clipboard || typeof navigator.clipboard.write !== 'function' || typeof ClipboardItem === 'undefined') {
+      throw new Error('clipboard-image-unsupported');
+    }
+    await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+    setTransientButtonContent(trigger, trigger.dataset.successHtml || '已复制', 'is-success');
+    return true;
+  } catch (error) {
+    setTransientButtonContent(trigger, trigger.dataset.failureHtml || '复制失败', 'is-error');
+    return false;
+  }
+}
+
+async function downloadWidgetImage(frameId, widgetTitle, trigger) {
+  try {
+    const capture = await requestWidgetCapture(frameId);
+    const fileName = sanitizeExportName(widgetTitle || frameId) + '.png';
+    downloadDataUrl(capture.dataUrl, fileName);
+    setTransientButtonContent(trigger, trigger.dataset.successHtml || '已开始下载', 'is-success');
+    return true;
+  } catch (error) {
+    setTransientButtonContent(trigger, trigger.dataset.failureHtml || '下载失败', 'is-error');
+    return false;
+  }
+}
+
 document.addEventListener('click', (event) => {
   const tocLink = event.target.closest('.toc-link');
   if (tocLink) {
@@ -1669,6 +2361,33 @@ document.addEventListener('click', (event) => {
       tocPanel.querySelectorAll('.toc-link').forEach((link) => link.classList.remove('is-active'));
     }
     tocLink.classList.add('is-active');
+  }
+
+  const widgetMenuToggle = event.target.closest('[data-widget-menu-toggle]');
+  if (widgetMenuToggle) {
+    const frameId = widgetMenuToggle.dataset.widgetMenuToggle || '';
+    const menu = document.querySelector('.widget-menu[data-widget-menu="' + frameId + '"]');
+    const shouldOpen = !menu || menu.hidden;
+    closeWidgetMenus(shouldOpen ? frameId : '');
+    return;
+  }
+
+  const widgetActionBtn = event.target.closest('[data-widget-action]');
+  if (widgetActionBtn) {
+    const frameId = widgetActionBtn.dataset.iframeId || '';
+    const widgetTitle = widgetActionBtn.dataset.widgetTitle || frameId || 'widget';
+    if (widgetActionBtn.dataset.widgetAction === 'copy-image') {
+      copyWidgetImage(frameId, widgetTitle, widgetActionBtn);
+    } else if (widgetActionBtn.dataset.widgetAction === 'download-image') {
+      downloadWidgetImage(frameId, widgetTitle, widgetActionBtn);
+    }
+    return;
+  }
+
+  const copyBtn = event.target.closest('[data-copy-source-id]');
+  if (copyBtn) {
+    copyAttachmentText(copyBtn.dataset.copySourceId, copyBtn);
+    return;
   }
 
   const openBtn = event.target.closest('.att-button');
@@ -1691,19 +2410,36 @@ document.addEventListener('click', (event) => {
   const dialog = event.target.closest('dialog.att-dialog');
   if (dialog && event.target === dialog) {
     dialog.close();
+    return;
   }
+
+  closeWidgetMenus();
 });
 
 window.addEventListener('message', (event) => {
   const data = event.data || {};
-  if (data.type !== 'claude-export-widget-height') return;
-  const frame = Array.from(document.querySelectorAll('.widget-iframe')).find((el) => el.dataset.iframeId === data.frameId);
-  if (!frame) return;
-  const height = Number(data.height || 0);
-  if (!Number.isFinite(height) || height <= 0) return;
-  frame.style.height = Math.max(120, Math.ceil(height)) + 'px';
-  postPageHeight();
-  setTimeout(postPageHeight, 0);
+  if (data.type === 'claude-export-widget-height') {
+    const frame = findWidgetFrame(data.frameId);
+    if (!frame) return;
+    const height = Number(data.height || 0);
+    if (!Number.isFinite(height) || height <= 0) return;
+    frame.style.height = Math.max(120, Math.ceil(height)) + 'px';
+    postPageHeight();
+    setTimeout(postPageHeight, 0);
+    return;
+  }
+
+  if (data.type === 'claude-export-widget-capture-result') {
+    const pending = widgetCaptureRequests.get(data.requestId || '');
+    if (!pending) return;
+    clearTimeout(pending.timeoutId);
+    widgetCaptureRequests.delete(data.requestId || '');
+    if (data.ok && data.dataUrl) {
+      pending.resolve(data);
+    } else {
+      pending.reject(new Error(data.error || 'widget-capture-failed'));
+    }
+  }
 });
 
 if (typeof ResizeObserver !== 'undefined') {
