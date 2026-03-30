@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+
+# Editor / local workspace
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment / secrets
+.env
+.env.*
+*.local
+
+# Generated export artifacts
+exports/
+artifacts/
+tmp/
+temp/
+screenshots/
+review-assets/
+samples/private/
+
+# Common exported chat file naming pattern
+*_20??-??-??_??????.html
+*_20??-??-??_??????.md
+
+# Manual local review files
+*-preview.html
+*-preview.md
+*-preview.png
+*-before.png
+*-after.png
+

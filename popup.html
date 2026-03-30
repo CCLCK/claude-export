@@ -16,9 +16,31 @@
     }
     button:hover { background: #6d28d9; }
     button:disabled { background: #4b4b6b; cursor: not-allowed; }
+    .options {
+      margin: 10px 0 12px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.06);
+    }
+    .option-row {
+      display: flex; gap: 8px; align-items: flex-start;
+      font-size: 12px; color: #d7d7ef; line-height: 1.45;
+    }
+    .option-row input {
+      margin: 2px 0 0;
+      accent-color: #7c3aed;
+    }
+    .option-meta {
+      display: block;
+      margin-top: 2px;
+      font-size: 11px;
+      color: #9fa0c7;
+    }
     #status {
       margin-top: 10px; font-size: 12px; color: #a0a0c0;
       text-align: center; min-height: 18px;
+      white-space: normal; line-height: 1.45;
     }
     #status.error  { color: #f87171; }
     #status.success { color: #4ade80; }
@@ -26,6 +48,14 @@
 </head>
 <body>
   <h2>📄 Claude 聊天导出（离线版）</h2>
+  <div class="options">
+    <label class="option-row" for="includeThinking">
+      <input id="includeThinking" type="checkbox"/>
+      <span>包含思维链
+        <span class="option-meta">默认关闭。只在你明确想保留 thinking block 时再勾选。</span>
+      </span>
+    </label>
+  </div>
   <button id="exportBtn">导出为完全离线 HTML</button>
   <div id="status"></div>
   <script src="popup.js"></script>
