@@ -50,9 +50,40 @@ function readExportProgress(runId) {
   return store[key] || null;
 }
 
-function buildObsidianMarkdown({ title, htmlFileName, sourceUrl }) {
+function formatMarkdownBlockquote(text) {
+  const lines = String(text || '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => line.trimEnd());
+  const safeLines = lines.length > 0 ? lines : [''];
+  return safeLines.map((line) => `> ${line || ' '}`).join('\n');
+}
+
+function escapeMarkdownHeadingText(text) {
+  return String(text || '')
+    .replace(/\r?\n+/g, ' ')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\\/g, '\\\\')
+    .replace(/([`*_{}\[\]()#+.!|~-])/g, '\\$1')
+    .trim();
+}
+
+function buildPromptSummaryMarkdown(promptSummaries) {
+  if (!Array.isArray(promptSummaries) || promptSummaries.length === 0) return '';
+  const blocks = promptSummaries.map((item, index) => {
+    const label = escapeMarkdownHeadingText(item && item.label || `问题 ${index + 1}`);
+    const text = String(item && item.text || '（该条用户消息主要是附件或空文本，没有可提取的 prompt 文本。）').trim();
+    return `### 问题 ${index + 1}：${label}\n${formatMarkdownBlockquote(text)}`;
+  });
+  return `## 用户问题汇总\n\n${blocks.join('\n\n')}\n`;
+}
+
+function buildObsidianMarkdown({ title, htmlFileName, sourceUrl, promptSummaries }) {
   const date = formatLocalDate();
   const relativeHref = encodeURI(`./${htmlFileName}`);
+  const promptSummarySection = buildPromptSummaryMarkdown(promptSummaries);
   return `---
 title: ${yamlQuoted(title || 'Claude Chat')}
 tags: [export, claude, visualization]
@@ -72,7 +103,7 @@ html_export: ${yamlQuoted(htmlFileName)}
 - [[${htmlFileName}|打开交互版 HTML]]
 - [通过相对路径打开](${relativeHref})
 
-## 说明
+${promptSummarySection ? `${promptSummarySection}\n` : ''}## 说明
 
 - 如果点击后在 Obsidian 内还是不显示，请直接在文件管理器或默认浏览器中打开 \`${htmlFileName}\`。
 - 这篇笔记的作用是检索、标签、双链和归档管理；真正的交互内容保存在同目录 HTML 附件里。
@@ -81,6 +112,7 @@ html_export: ${yamlQuoted(htmlFileName)}
 
 document.getElementById('exportBtn').addEventListener('click', async () => {
   const btn = document.getElementById('exportBtn');
+  const includeThinking = Boolean(document.getElementById('includeThinking')?.checked);
   const status = document.getElementById('status');
   btn.disabled = true;
   status.className = '';
@@ -99,8 +131,10 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
     const runId = `claude-export-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     let pollTimer = null;
     let pollBusy = false;
+    let pollingActive = true;
 
     const stopPolling = () => {
+      pollingActive = false;
       if (pollTimer) {
         clearInterval(pollTimer);
         pollTimer = null;
@@ -108,7 +142,7 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
     };
 
     const pollProgress = async () => {
-      if (pollBusy) return;
+      if (pollBusy || !pollingActive) return;
       pollBusy = true;
       try {
         const [progressResult] = await chrome.scripting.executeScript({
@@ -118,7 +152,7 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
           world: 'MAIN'
         });
         const progress = progressResult && progressResult.result;
-        if (progress && progress.message) {
+        if (pollingActive && progress && progress.message) {
           status.textContent = progress.message;
         }
       } catch (e) {
@@ -131,7 +165,7 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
     const exportPromise = chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: extractAndBuild,
-      args: [runId],
+      args: [runId, { includeThinking }],
       world: 'MAIN'
     });
     pollTimer = setInterval(() => {
@@ -162,6 +196,7 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
       title: title || 'Claude Chat',
       htmlFileName,
       sourceUrl: tab.url,
+      promptSummaries: Array.isArray(results[0].result.promptSummaries) ? results[0].result.promptSummaries : [],
     });
 
     triggerDownload(html, htmlFileName, 'text/html;charset=utf-8');
@@ -180,8 +215,9 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
 // =====================================================================
 // 以下函数在页面上下文（claude.ai）中执行
 // =====================================================================
-function extractAndBuild(runId) {
+function extractAndBuild(runId, options) {
   const exportRunId = String(runId || `claude-export-${Date.now()}`);
+  const includeThinking = Boolean(options && options.includeThinking);
   const progressStore = window.__CLAUDE_EXPORT_RUNS || (window.__CLAUDE_EXPORT_RUNS = {});
   const setProgress = (patch) => {
     progressStore[exportRunId] = {
@@ -725,6 +761,14 @@ function extractAndBuild(runId) {
     return `${prefix}-${slug || 'section'}-${index}`;
   }
 
+  function summarizePromptLabel(text, index) {
+    const compact = String(text || '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!compact) return `问题 ${index}`;
+    return compact.length > 28 ? `${compact.slice(0, 28)}…` : compact;
+  }
+
   function isThinkingPart(part) {
     const type = String(part && part.type || '').toLowerCase();
     return type.includes('thinking');
@@ -1079,6 +1123,8 @@ marker path { stroke: #7F77DD; fill: none; }
 
     // ── 构建对话 HTML ────────────────────────────────────────────────
     const turnsHtml = [];
+    const promptTocItems = [];
+    const promptSummaries = [];
     const widgetTocItems = [];
 
     for (const msg of chatMsgs) {
@@ -1098,6 +1144,17 @@ marker path { stroke: #7F77DD; fill: none; }
 
         if (!textContent.trim() && attList.length === 0) continue;
 
+        const promptLabel = summarizePromptLabel(rawTextContent, promptTocItems.length + 1);
+        const promptSectionId = makeAnchorId('prompt', promptLabel, promptTocItems.length + 1);
+        promptTocItems.push({
+          id: promptSectionId,
+          title: promptLabel,
+        });
+        promptSummaries.push({
+          label: promptLabel,
+          text: rawTextContent.trim() || '（该条用户消息主要是附件或空文本，没有可提取的 prompt 文本。）',
+        });
+
         const attachHtml = attList.length > 0
           ? `<div class="attachments">${attList.map(a =>
               `<button type="button" class="att-tag att-button" data-target="${a.dialogId}">${getFileIcon(a.type || a.name)} ${escHtml(a.name)}</button>`
@@ -1105,15 +1162,17 @@ marker path { stroke: #7F77DD; fill: none; }
           : '';
         const dialogHtml = attList.map(a => renderAttachmentDialog(a, a.dialogId)).join('');
         turnsHtml.push(`
-<div class="turn user-turn">
-  <div class="avatar ua">你</div>
-  <div class="bubble ub">
-    ${attachHtml}
-    <div class="md user-text">${md2html(textContent)}</div>
-    ${timeLabel ? `<div class="turn-time">${escHtml(timeLabel)}</div>` : ''}
-    ${dialogHtml}
+<section id="${promptSectionId}" class="prompt-section">
+  <div class="turn user-turn">
+    <div class="avatar ua">你</div>
+    <div class="bubble ub">
+      ${attachHtml}
+      <div class="md user-text">${md2html(textContent)}</div>
+      ${timeLabel ? `<div class="turn-time">${escHtml(timeLabel)}</div>` : ''}
+      ${dialogHtml}
+    </div>
   </div>
-</div>`);
+</section>`);
         continue;
       }
 
@@ -1131,7 +1190,7 @@ marker path { stroke: #7F77DD; fill: none; }
             const textHtml = md2html(await inlineTextAssetUrls(c.text));
             parts.push(`<div class="md">${textHtml}</div>`);
           }
-          if (isThinkingPart(c)) {
+          if (includeThinking && isThinkingPart(c)) {
             const thinkingText = await inlineTextAssetUrls(extractThinkingText(c));
             parts.push(renderThinkingBlock(thinkingText));
           }
@@ -1307,6 +1366,7 @@ body {
 .user-turn .turn-time {
   text-align: right;
 }
+.prompt-section { scroll-margin-top: 28px; }
 
 /* ── Markdown 正文 ── */
 .md { font-size: 16px; }
@@ -1415,17 +1475,15 @@ body {
 }
 
 /* ── 右侧目录 ── */
-.toc-panel {
-  display: none;
-}
+.toc-panel { display: none; }
 
 @media (min-width: 1380px) {
-  .toc-panel {
+  .toc-panel--right {
     display: block;
     position: fixed;
     top: 88px;
     right: 24px;
-    width: 220px;
+    width: 210px;
     max-height: calc(100vh - 120px);
     overflow: auto;
     padding: 14px 12px;
@@ -1435,6 +1493,31 @@ body {
     box-shadow: 0 10px 30px rgba(20,20,19,.08);
     backdrop-filter: blur(10px);
     z-index: 20;
+  }
+}
+
+@media (min-width: 1380px) {
+  .toc-panel--left {
+    display: block;
+    position: fixed;
+    top: 88px;
+    left: 24px;
+    width: 210px;
+    max-height: calc(100vh - 120px);
+    overflow: auto;
+    padding: 14px 12px;
+    border: 1px solid #e8e4dc;
+    border-radius: 16px;
+    background: rgba(255,255,255,.92);
+    box-shadow: 0 10px 30px rgba(20,20,19,.08);
+    backdrop-filter: blur(10px);
+    z-index: 20;
+  }
+}
+
+@media (min-width: 1380px) {
+  .toc-panel {
+    scrollbar-width: thin;
   }
 
   .toc-title {
@@ -1581,7 +1664,10 @@ function queuePageHeightPost() {
 document.addEventListener('click', (event) => {
   const tocLink = event.target.closest('.toc-link');
   if (tocLink) {
-    document.querySelectorAll('.toc-link').forEach((link) => link.classList.remove('is-active'));
+    const tocPanel = tocLink.closest('.toc-panel');
+    if (tocPanel) {
+      tocPanel.querySelectorAll('.toc-link').forEach((link) => link.classList.remove('is-active'));
+    }
     tocLink.classList.add('is-active');
   }
 
@@ -1630,17 +1716,19 @@ if (typeof ResizeObserver !== 'undefined') {
 }
 
 if (typeof IntersectionObserver !== 'undefined') {
-  const tocLinks = Array.from(document.querySelectorAll('.toc-link'));
-  const sectionById = new Map(
-    tocLinks
-      .map((link) => {
-        const targetId = link.dataset.targetId || '';
-        return [targetId, document.getElementById(targetId)];
-      })
-      .filter(([, section]) => section)
-  );
+  document.querySelectorAll('.toc-panel').forEach((panel) => {
+    const tocLinks = Array.from(panel.querySelectorAll('.toc-link'));
+    const sectionById = new Map(
+      tocLinks
+        .map((link) => {
+          const targetId = link.dataset.targetId || '';
+          return [targetId, document.getElementById(targetId)];
+        })
+        .filter(([, section]) => section)
+    );
 
-  if (sectionById.size > 0) {
+    if (sectionById.size === 0) return;
+
     const activateTocLink = (targetId) => {
       tocLinks.forEach((link) => link.classList.toggle('is-active', link.dataset.targetId === targetId));
     };
@@ -1658,7 +1746,7 @@ if (typeof IntersectionObserver !== 'undefined') {
     });
 
     sectionById.forEach((section) => observer.observe(section));
-  }
+  });
 }
 
 window.addEventListener('load', () => {
@@ -1672,13 +1760,27 @@ postPageHeight();
 `;
 
   // ── 组装完整 HTML ─────────────────────────────────────────────────
-      const tocHtml = widgetTocItems.length > 0
+      const promptTocHtml = promptTocItems.length > 0
         ? `
-  <aside class="toc-panel" aria-label="对话目录">
-    <div class="toc-title">目录</div>
+  <aside class="toc-panel toc-panel--left" aria-label="问题目录">
+    <div class="toc-title">问题目录</div>
+    <nav class="toc-nav">
+      ${promptTocItems.map((item, index) => `
+      <a class="toc-link prompt-toc-link${index === 0 ? ' is-active' : ''}" href="#${escHtml(item.id)}" data-target-id="${escHtml(item.id)}">
+        <span class="toc-index">${index + 1}</span>
+        <span class="toc-text">${escHtml(item.title)}</span>
+      </a>`).join('')}
+    </nav>
+  </aside>`
+        : '';
+
+      const widgetTocHtml = widgetTocItems.length > 0
+        ? `
+  <aside class="toc-panel toc-panel--right" aria-label="控件目录">
+    <div class="toc-title">控件目录</div>
     <nav class="toc-nav">
       ${widgetTocItems.map((item, index) => `
-      <a class="toc-link${index === 0 ? ' is-active' : ''}" href="#${escHtml(item.id)}" data-target-id="${escHtml(item.id)}">
+      <a class="toc-link widget-toc-link${index === 0 ? ' is-active' : ''}" href="#${escHtml(item.id)}" data-target-id="${escHtml(item.id)}">
         <span class="toc-index">${index + 1}</span>
         <span class="toc-text">${escHtml(item.title)}</span>
       </a>`).join('')}
@@ -1695,7 +1797,8 @@ postPageHeight();
   <style>${PAGE_CSS}</style>
 </head>
 <body>
-  ${tocHtml}
+  ${promptTocHtml}
+  ${widgetTocHtml}
   <div class="chat-container">
     <h1 class="chat-title">💬 ${escHtml(chatTitle)}</h1>
     ${turnsHtml.join('\n')}
@@ -1712,7 +1815,7 @@ postPageHeight();
         message: '✅ 导出成功！',
       });
       scheduleProgressCleanup();
-      return { html: fullHtml, title: chatTitle };
+      return { html: fullHtml, title: chatTitle, promptSummaries };
     } catch (e) {
       return fail(e && e.message ? e.message : String(e));
     }
