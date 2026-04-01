@@ -140,6 +140,440 @@ ${promptSummarySection ? `${promptSummarySection}\n` : ''}## 说明
 `;
 }
 
+// ── 提取消息摘要列表（在页面上下文执行）────────────────────────
+function extractMessageList() {
+  function findQueryClient() {
+    const root = document.getElementById('root');
+    if (!root) return null;
+    const fiberKey = Object.keys(root).find((k) => k.startsWith('__reactContainer'));
+    if (!fiberKey) return null;
+    const visited = new WeakSet();
+    function walk(fiber, depth) {
+      if (!fiber || depth > 200) return null;
+      if (visited.has(fiber)) return null;
+      visited.add(fiber);
+      try {
+        const v = fiber.memoizedProps && fiber.memoizedProps.value;
+        if (v && typeof v === 'object') {
+          if (typeof v.getQueryCache === 'function') return v;
+          if (v.client && typeof v.client.getQueryCache === 'function') return v.client;
+        }
+      } catch (error) {}
+      return walk(fiber.child, depth + 1) || walk(fiber.sibling, depth);
+    }
+    return walk(root[fiberKey], 0);
+  }
+
+  const currentChatUuid = window.location.pathname.split('/').pop();
+  const qc = findQueryClient();
+  if (!qc) return { error: 'React Query Client 未找到，请确保页面已完整加载' };
+
+  const allQueries = qc.getQueryCache().getAll();
+  const treeQuery = allQueries.find((q) =>
+    JSON.stringify(q.queryKey || '').includes(currentChatUuid)
+    && q.state.data && q.state.data.chat_messages
+  );
+  if (!treeQuery || !treeQuery.state.data) {
+    return { error: '对话数据未找到，请确保页面已完整加载' };
+  }
+
+  const msgs = (treeQuery.state.data.chat_messages || [])
+    .slice()
+    .sort((a, b) => (a.index || 0) - (b.index || 0));
+
+  return {
+    title: treeQuery.state.data.name || 'Claude Chat',
+    messages: msgs
+      .filter((msg) => msg.sender === 'human')
+      .map((msg) => {
+        const contentParts = Array.isArray(msg.content) ? msg.content : [];
+        const text = contentParts
+          .filter((c) => c.type === 'text')
+          .map((c) => c.text || '')
+          .join('')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 80);
+        const attachCount = (msg.attachments || []).length + (msg.files || []).length;
+        return {
+          uuid: String(msg.uuid || msg.index || ''),
+          index: msg.index || 0,
+          sender: msg.sender,
+          preview: text || (attachCount > 0 ? `[${attachCount} 个附件]` : '（空）'),
+          hasAttach: attachCount > 0,
+        };
+      }),
+  };
+}
+
+function askFileNameOnPage(defaultName) {
+  const result = window.prompt('请输入导出文件名（不含扩展名）：', defaultName);
+  if (result === null) return null;
+  const cleaned = String(result).trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-')
+    .replace(/\s+/g, ' ')
+    .replace(/\.+$/g, '')
+    .slice(0, 120);
+  return cleaned || defaultName;
+}
+
+function removeSelectUI() {
+  if (typeof window.__CLAUDE_EXPORT_REMOVE_SELECT_UI === 'function') {
+    window.__CLAUDE_EXPORT_REMOVE_SELECT_UI();
+    return { ok: true };
+  }
+  document.getElementById('__claude-export-toolbar')?.remove();
+  document.getElementById('__claude-export-select-style')?.remove();
+  document.body.classList.remove('__claude-select-mode');
+  window.__CLAUDE_EXPORT_SELECT_ACTIVE = false;
+  window.__CLAUDE_EXPORT_PENDING_EXPORT = null;
+  return { ok: true };
+}
+
+function readPendingExport() {
+  const pending = window.__CLAUDE_EXPORT_PENDING_EXPORT || null;
+  if (pending) {
+    window.__CLAUDE_EXPORT_PENDING_EXPORT = null;
+  }
+  return pending;
+}
+
+function installSelectUI(config) {
+  if (window.__CLAUDE_EXPORT_SELECT_ACTIVE) {
+    return { ok: true, alreadyActive: true };
+  }
+
+  function findQueryClient() {
+    const root = document.getElementById('root');
+    if (!root) return null;
+    const fiberKey = Object.keys(root).find((k) => k.startsWith('__reactContainer'));
+    if (!fiberKey) return null;
+    const visited = new WeakSet();
+    function walk(fiber, depth) {
+      if (!fiber || depth > 200) return null;
+      if (visited.has(fiber)) return null;
+      visited.add(fiber);
+      try {
+        const v = fiber.memoizedProps && fiber.memoizedProps.value;
+        if (v && typeof v === 'object') {
+          if (typeof v.getQueryCache === 'function') return v;
+          if (v.client && typeof v.client.getQueryCache === 'function') return v.client;
+        }
+      } catch (error) {}
+      return walk(fiber.child, depth + 1) || walk(fiber.sibling, depth);
+    }
+    return walk(root[fiberKey], 0);
+  }
+
+  const currentChatUuid = window.location.pathname.split('/').pop();
+  const qc = findQueryClient();
+  if (!qc) return { ok: false, error: 'React Query Client 未找到，请确保页面已完整加载' };
+
+  const allQueries = qc.getQueryCache().getAll();
+  const treeQuery = allQueries.find((q) =>
+    JSON.stringify(q.queryKey || '').includes(currentChatUuid) &&
+    q.state.data && q.state.data.chat_messages
+  );
+  if (!treeQuery) return { ok: false, error: '对话数据未找到，请确保页面已完整加载' };
+
+  const humanMessages = (treeQuery.state.data.chat_messages || [])
+    .slice()
+    .sort((a, b) => (a.index || 0) - (b.index || 0))
+    .filter((msg) => msg.sender === 'human');
+
+  const style = document.createElement('style');
+  style.id = '__claude-export-select-style';
+  style.textContent = `
+    .__ce-user-row {
+      display: flex !important;
+      flex-direction: row !important;
+      align-items: flex-start !important;
+    }
+    .__ce-chk-col {
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 36px;
+      padding-top: 14px;
+      opacity: 0;
+      transform: translateX(-6px);
+      transition: opacity .2s ease, transform .2s ease;
+      pointer-events: none;
+    }
+    .__ce-chk-col.ready {
+      opacity: 1;
+      transform: translateX(0);
+      pointer-events: auto;
+    }
+    .__ce-chk {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      border: 2px solid #d8c6ac;
+      background: #fff;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: border-color .15s, background .15s, box-shadow .15s;
+      flex-shrink: 0;
+      box-sizing: border-box;
+    }
+    .__ce-chk:hover {
+      border-color: #a36422;
+      box-shadow: 0 0 0 3px rgba(163,100,34,.15);
+    }
+    .__ce-chk.checked {
+      border-color: #a36422;
+      background: #a36422;
+    }
+    .__ce-chk.checked::after {
+      content: '';
+      display: block;
+      width: 6px;
+      height: 10px;
+      border: 2px solid #fff;
+      border-top: none;
+      border-left: none;
+      transform: rotate(45deg) translate(-1px, -1px);
+    }
+    .__ce-turn-selected {
+      background: rgba(163,100,34,.05) !important;
+      border-radius: 12px;
+      outline: 1.5px solid rgba(163,100,34,.18);
+      outline-offset: 2px;
+      transition: background .15s, outline .15s;
+    }
+    #__claude-export-toolbar {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%) translateY(80px);
+      opacity: 0;
+      transition: transform .28s cubic-bezier(.34,1.56,.64,1), opacity .22s ease;
+      z-index: 99999;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 16px;
+      border-radius: 20px;
+      background: rgba(250,247,241,.97);
+      border: 1px solid #d8c6ac;
+      box-shadow: 0 8px 32px rgba(114,91,56,.22), 0 2px 8px rgba(114,91,56,.12);
+      backdrop-filter: blur(12px);
+      white-space: nowrap;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    #__claude-export-toolbar.show {
+      transform: translateX(-50%) translateY(0);
+      opacity: 1;
+    }
+    #__ce-toolbar-count {
+      font-size: 13px;
+      font-weight: 600;
+      color: #7a6d5a;
+      min-width: 90px;
+    }
+    #__ce-toolbar-export,
+    #__ce-select-all-btn,
+    #__ce-toolbar-cancel {
+      padding: 9px 14px;
+      border-radius: 12px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid #d8c6ac;
+      font-family: inherit;
+    }
+    #__ce-toolbar-export {
+      background: linear-gradient(180deg, #b57229 0%, #9c5d1f 100%);
+      color: #fffaf2;
+      box-shadow: 0 4px 12px rgba(156,93,31,.25);
+      padding: 9px 18px;
+    }
+    #__ce-toolbar-export:hover:not(:disabled) {
+      background: linear-gradient(180deg, #bf7a2d 0%, #a76422 100%);
+    }
+    #__ce-toolbar-export:disabled {
+      background: linear-gradient(180deg, #c9baa7 0%, #b4a28c 100%);
+      box-shadow: none;
+      cursor: not-allowed;
+    }
+    #__ce-select-all-btn,
+    #__ce-toolbar-cancel {
+      background: transparent;
+      color: #7a6d5a;
+    }
+    #__ce-select-all-btn:hover,
+    #__ce-toolbar-cancel:hover {
+      background: rgba(163,100,34,.08);
+      color: #3f3a33;
+    }
+  `;
+  document.head.appendChild(style);
+
+  const userMsgEls = Array.from(document.querySelectorAll('[data-testid="user-message"]'));
+  if (userMsgEls.length === 0) {
+    style.remove();
+    return { ok: false, error: '未找到用户消息元素（[data-testid="user-message"]），请确保页面已完整加载' };
+  }
+
+  function getUuidFromEl(el) {
+    const fiberKey = Object.keys(el).find((k) => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+    if (!fiberKey) return null;
+    try {
+      let fiber = el[fiberKey];
+      for (let i = 0; i < 30; i += 1) {
+        if (!fiber) break;
+        const props = fiber.memoizedProps || fiber.pendingProps || {};
+        if (props.message && props.message.uuid) return String(props.message.uuid);
+        if (props.uuid) return String(props.uuid);
+        fiber = fiber.return;
+      }
+    } catch (error) {}
+    return null;
+  }
+
+  const turnData = [];
+
+  userMsgEls.forEach((msgEl, index) => {
+    let depth5 = msgEl;
+    for (let step = 0; step < 5; step += 1) {
+      if (!depth5.parentElement) break;
+      depth5 = depth5.parentElement;
+    }
+
+    if (!depth5 || !depth5.parentElement || depth5.querySelector(':scope > .__ce-chk-col')) {
+      return;
+    }
+
+    const depth6 = depth5.parentElement;
+    const aiSiblingEl = depth6 ? depth6.nextElementSibling : null;
+    const uuid = getUuidFromEl(msgEl) || (humanMessages[index] ? String(humanMessages[index].uuid) : `__ce-turn-${index}`);
+
+    const origStyle = {
+      display: depth5.style.display,
+      flexDirection: depth5.style.flexDirection,
+      alignItems: depth5.style.alignItems,
+    };
+
+    depth5.classList.add('__ce-user-row');
+
+    const chkCol = document.createElement('div');
+    chkCol.className = '__ce-chk-col';
+    const chk = document.createElement('div');
+    chk.className = '__ce-chk';
+    chkCol.appendChild(chk);
+    depth5.prepend(chkCol);
+
+    const toggle = (forceState) => {
+      const shouldCheck = forceState !== undefined ? forceState : !chk.classList.contains('checked');
+      chk.classList.toggle('checked', shouldCheck);
+      if (depth6) depth6.classList.toggle('__ce-turn-selected', shouldCheck);
+      if (aiSiblingEl) aiSiblingEl.classList.toggle('__ce-turn-selected', shouldCheck);
+      updateToolbar();
+    };
+
+    chk.addEventListener('click', (event) => {
+      event.stopPropagation();
+      toggle();
+    });
+    depth5.addEventListener('click', (event) => {
+      if (event.target.closest('a, button, input, textarea, select, [role="button"], .__ce-chk')) return;
+      toggle();
+    });
+
+    turnData.push({ uuid, depth5, depth6, aiSiblingEl, chk, chkCol, origStyle });
+  });
+
+  if (turnData.length === 0) {
+    style.remove();
+    return { ok: false, error: '未找到可选择的用户消息节点，请确保当前页面已完整加载' };
+  }
+
+  const toolbar = document.createElement('div');
+  toolbar.id = '__claude-export-toolbar';
+  toolbar.innerHTML = `
+    <button id="__ce-select-all-btn" type="button">全选</button>
+    <span id="__ce-toolbar-count">已选 0 条</span>
+    <button id="__ce-toolbar-export" type="button" disabled>导出选中</button>
+    <button id="__ce-toolbar-cancel" type="button">取消</button>
+  `;
+  document.body.appendChild(toolbar);
+
+  window.__CLAUDE_EXPORT_SELECT_ACTIVE = true;
+  window.__CLAUDE_EXPORT_PENDING_EXPORT = null;
+
+  const cleanup = () => {
+    turnData.forEach(({ depth5, depth6, aiSiblingEl, chkCol, origStyle }) => {
+      depth5.classList.remove('__ce-user-row');
+      depth5.style.display = origStyle.display;
+      depth5.style.flexDirection = origStyle.flexDirection;
+      depth5.style.alignItems = origStyle.alignItems;
+      chkCol.remove();
+      if (depth6) depth6.classList.remove('__ce-turn-selected');
+      if (aiSiblingEl) aiSiblingEl.classList.remove('__ce-turn-selected');
+    });
+    toolbar.remove();
+    style.remove();
+    window.__CLAUDE_EXPORT_SELECT_ACTIVE = false;
+    window.__CLAUDE_EXPORT_PENDING_EXPORT = null;
+    delete window.__CLAUDE_EXPORT_REMOVE_SELECT_UI;
+  };
+  window.__CLAUDE_EXPORT_REMOVE_SELECT_UI = cleanup;
+
+  const countEl = toolbar.querySelector('#__ce-toolbar-count');
+  const exportBtn = toolbar.querySelector('#__ce-toolbar-export');
+  const selAllBtn = toolbar.querySelector('#__ce-select-all-btn');
+  const cancelBtn = toolbar.querySelector('#__ce-toolbar-cancel');
+
+  const selectedTurns = () => turnData.filter((item) => item.chk.classList.contains('checked'));
+  const updateToolbar = () => {
+    const checked = selectedTurns();
+    countEl.textContent = `已选 ${checked.length} 条`;
+    exportBtn.disabled = checked.length === 0;
+    selAllBtn.textContent = checked.length === turnData.length ? '取消全选' : '全选';
+  };
+
+  selAllBtn.addEventListener('click', () => {
+    const shouldSelectAll = selectedTurns().length !== turnData.length;
+    turnData.forEach((item) => {
+      item.chk.classList.toggle('checked', shouldSelectAll);
+      if (item.depth6) item.depth6.classList.toggle('__ce-turn-selected', shouldSelectAll);
+      if (item.aiSiblingEl) item.aiSiblingEl.classList.toggle('__ce-turn-selected', shouldSelectAll);
+    });
+    updateToolbar();
+  });
+
+  cancelBtn.addEventListener('click', () => cleanup());
+
+  exportBtn.addEventListener('click', async () => {
+    const selected = selectedTurns();
+    if (selected.length === 0) return;
+    window.__CLAUDE_EXPORT_PENDING_EXPORT = {
+      selectedUuids: selected.map((item) => item.uuid),
+      timestamp: Date.now(),
+    };
+    countEl.textContent = '正在准备导出…';
+    exportBtn.disabled = true;
+    selAllBtn.disabled = true;
+    cancelBtn.disabled = true;
+  });
+
+  requestAnimationFrame(() => {
+    setTimeout(() => {
+      toolbar.classList.add('show');
+      turnData.forEach((item, idx) => {
+        setTimeout(() => item.chkCol.classList.add('ready'), idx * 20);
+      });
+    }, 80);
+  });
+
+  updateToolbar();
+  return { ok: true, alreadyActive: false, count: turnData.length };
+}
+
 const widgetImagePresetSelect = document.getElementById('widgetImagePreset');
 if (widgetImagePresetSelect) {
   widgetImagePresetSelect.value = loadWidgetImagePresetId();
@@ -148,31 +582,66 @@ if (widgetImagePresetSelect) {
   });
 }
 
-document.getElementById('exportBtn').addEventListener('click', async () => {
-  const btn = document.getElementById('exportBtn');
+const exportBtn = document.getElementById('exportBtn');
+const selectMsgBtn = document.getElementById('selectMsgBtn');
+const statusEl = document.getElementById('status');
+const selectModeHint = document.getElementById('selectModeHint');
+const cancelSelectPageBtn = document.getElementById('cancelSelectPageBtn');
+let pendingExportPollTimer = null;
+
+function setStatus(message, type = '') {
+  if (!statusEl) return;
+  statusEl.textContent = message || '';
+  statusEl.className = type || '';
+}
+
+function setSelectModeHint(visible) {
+  if (selectModeHint) selectModeHint.classList.toggle('visible', Boolean(visible));
+  if (cancelSelectPageBtn) cancelSelectPageBtn.style.display = visible ? '' : 'none';
+}
+
+function stopPendingExportPoll() {
+  if (pendingExportPollTimer) {
+    clearInterval(pendingExportPollTimer);
+    pendingExportPollTimer = null;
+  }
+}
+
+async function getActiveClaudeTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab || !String(tab.url || '').includes('claude.ai')) {
+    throw new Error('请在 Claude 聊天页面使用');
+  }
+  return tab;
+}
+
+async function maybeResolveBaseName(tabId, defaultBaseName, enableRename) {
+  if (!enableRename) return defaultBaseName;
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: askFileNameOnPage,
+    args: [defaultBaseName],
+    world: 'MAIN',
+  });
+  const value = result && result.result;
+  return value == null ? null : sanitizeBaseName(value) || defaultBaseName;
+}
+
+async function runExport(tab, { selectedUuids = null } = {}) {
   const includeThinking = Boolean(document.getElementById('includeThinking')?.checked);
+  const enableRename = Boolean(document.getElementById('enableRename')?.checked);
   const widgetImageExport = normalizeWidgetImagePreset(widgetImagePresetSelect?.value || DEFAULT_WIDGET_IMAGE_PRESET);
   saveWidgetImagePresetId(widgetImageExport.id);
-  const status = document.getElementById('status');
-  btn.disabled = true;
-  status.className = '';
-  status.textContent = '正在提取聊天记录…';
 
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-
-  if (!tab.url.includes('claude.ai')) {
-    status.textContent = '请在 Claude 聊天页面使用';
-    status.className = 'error';
-    btn.disabled = false;
-    return;
-  }
+  exportBtn.disabled = true;
+  if (selectMsgBtn) selectMsgBtn.disabled = true;
+  setStatus(selectedUuids ? '正在提取选中消息…' : '正在提取聊天记录…');
 
   try {
     const runId = `claude-export-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     let pollTimer = null;
     let pollBusy = false;
     let pollingActive = true;
-
     const stopPolling = () => {
       pollingActive = false;
       if (pollTimer) {
@@ -180,7 +649,6 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
         pollTimer = null;
       }
     };
-
     const pollProgress = async () => {
       if (pollBusy || !pollingActive) return;
       pollBusy = true;
@@ -189,14 +657,13 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
           target: { tabId: tab.id },
           func: readExportProgress,
           args: [runId],
-          world: 'MAIN'
+          world: 'MAIN',
         });
         const progress = progressResult && progressResult.result;
         if (pollingActive && progress && progress.message) {
-          status.textContent = progress.message;
+          setStatus(progress.message);
         }
-      } catch (e) {
-        // Popup polling is best-effort; final result still comes from the main export call.
+      } catch (error) {
       } finally {
         pollBusy = false;
       }
@@ -205,14 +672,11 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
     const exportPromise = chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: extractAndBuild,
-      args: [runId, { includeThinking, widgetImageExport }],
-      world: 'MAIN'
+      args: [runId, { includeThinking, widgetImageExport, selectedUuids }],
+      world: 'MAIN',
     });
-    pollTimer = setInterval(() => {
-      pollProgress();
-    }, 350);
+    pollTimer = setInterval(pollProgress, 350);
     await pollProgress();
-
     let results;
     try {
       results = await exportPromise;
@@ -220,37 +684,160 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
       stopPolling();
     }
 
-    const { html, title, error } = results[0].result;
-
+    const payload = results && results[0] && results[0].result;
+    const { html, title, error } = payload || {};
     if (error) {
-      status.textContent = '提取失败：' + error;
-      status.className = 'error';
-      btn.disabled = false;
+      throw new Error(error);
+    }
+    const defaultBaseName = sanitizeBaseName(`${title || 'claude-chat'}_${formatLocalTimestamp()}`);
+    const baseName = await maybeResolveBaseName(tab.id, defaultBaseName, enableRename);
+    if (baseName === null) {
+      setStatus('已取消导出');
       return;
     }
-
-    const baseName = sanitizeBaseName(`${title || 'claude-chat'}_${formatLocalTimestamp()}`);
     const htmlFileName = `${baseName}.html`;
     const mdFileName = `${baseName}.md`;
     const md = buildObsidianMarkdown({
       title: title || 'Claude Chat',
       htmlFileName,
       sourceUrl: tab.url,
-      promptSummaries: Array.isArray(results[0].result.promptSummaries) ? results[0].result.promptSummaries : [],
+      promptSummaries: Array.isArray(payload.promptSummaries) ? payload.promptSummaries : [],
     });
-
     triggerDownload(html, htmlFileName, 'text/html;charset=utf-8');
-    await new Promise(resolve => setTimeout(resolve, 150));
+    await new Promise((resolve) => setTimeout(resolve, 150));
     triggerDownload(md, mdFileName, 'text/markdown;charset=utf-8');
-
-    status.textContent = '✅ 已导出 HTML + Obsidian 模板';
-    status.className = 'success';
-  } catch (e) {
-    status.textContent = '导出失败：' + e.message;
-    status.className = 'error';
+    setStatus('✅ 已导出 HTML + Obsidian 模板', 'success');
+  } catch (error) {
+    setStatus(`导出失败：${error.message || error}`, 'error');
+  } finally {
+    exportBtn.disabled = false;
+    if (selectMsgBtn) selectMsgBtn.disabled = false;
   }
-  btn.disabled = false;
-});
+}
+
+async function resumePendingExportIfAny() {
+  try {
+    const tab = await getActiveClaudeTab();
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: readPendingExport,
+      world: 'MAIN',
+    });
+    const pending = result && result.result;
+    if (!pending || !Array.isArray(pending.selectedUuids) || pending.selectedUuids.length === 0) {
+      return false;
+    }
+    stopPendingExportPoll();
+    setSelectModeHint(false);
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: removeSelectUI,
+      world: 'MAIN',
+    });
+    await runExport(tab, { selectedUuids: pending.selectedUuids });
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+if (exportBtn) {
+  exportBtn.addEventListener('click', async () => {
+    try {
+      const tab = await getActiveClaudeTab();
+      await runExport(tab);
+    } catch (error) {
+      setStatus(error.message || String(error), 'error');
+      exportBtn.disabled = false;
+      if (selectMsgBtn) selectMsgBtn.disabled = false;
+    }
+  });
+}
+
+if (selectMsgBtn) {
+  selectMsgBtn.addEventListener('click', async () => {
+    try {
+      const tab = await getActiveClaudeTab();
+      const includeThinking = Boolean(document.getElementById('includeThinking')?.checked);
+      const enableRename = Boolean(document.getElementById('enableRename')?.checked);
+      const widgetImageExport = normalizeWidgetImagePreset(widgetImagePresetSelect?.value || DEFAULT_WIDGET_IMAGE_PRESET);
+      saveWidgetImagePresetId(widgetImageExport.id);
+
+      selectMsgBtn.disabled = true;
+      setStatus('正在注入页面选择模式…');
+
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: installSelectUI,
+        args: [{
+          includeThinking,
+          enableRename,
+          widgetImageExport,
+        }],
+        world: 'MAIN',
+      });
+
+      const payload = result && result.result;
+      if (!payload || !payload.ok) {
+        throw new Error(payload && payload.error ? payload.error : '注入选择模式失败');
+      }
+
+      setSelectModeHint(true);
+      setStatus(payload.alreadyActive ? '页面已处于选择模式' : `✅ 已进入选择模式，可选 ${payload.count} 条用户消息`, 'success');
+
+      stopPendingExportPoll();
+      pendingExportPollTimer = setInterval(async () => {
+        try {
+          const [res] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: readPendingExport,
+            world: 'MAIN',
+          });
+          const pending = res && res.result;
+          if (!pending) return;
+
+          stopPendingExportPoll();
+          setSelectModeHint(false);
+          selectMsgBtn.disabled = false;
+
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: removeSelectUI,
+            world: 'MAIN',
+          });
+
+          await runExport(tab, { selectedUuids: pending.selectedUuids });
+        } catch (error) {
+          stopPendingExportPoll();
+        }
+      }, 400);
+    } catch (error) {
+      setStatus(error.message || String(error), 'error');
+      selectMsgBtn.disabled = false;
+    }
+  });
+}
+
+if (cancelSelectPageBtn) {
+  cancelSelectPageBtn.addEventListener('click', async () => {
+    try {
+      stopPendingExportPoll();
+      const tab = await getActiveClaudeTab();
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: removeSelectUI,
+        world: 'MAIN',
+      });
+      setSelectModeHint(false);
+      setStatus('已退出选择模式');
+      if (selectMsgBtn) selectMsgBtn.disabled = false;
+    } catch (error) {
+      setStatus(error.message || String(error), 'error');
+    }
+  });
+}
+
+void resumePendingExportIfAny();
 
 // =====================================================================
 // 以下函数在页面上下文（claude.ai）中执行
@@ -258,6 +845,9 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
 function extractAndBuild(runId, options) {
   const exportRunId = String(runId || `claude-export-${Date.now()}`);
   const includeThinking = Boolean(options && options.includeThinking);
+  const selectedUuids = Array.isArray(options && options.selectedUuids) && options.selectedUuids.length > 0
+    ? new Set(options.selectedUuids.map((value) => String(value)))
+    : null;
   const normalizeWidgetImageExport = (value) => {
     const preset = value && typeof value === 'object' ? value : {};
     const scale = Number(preset.scale);
@@ -1313,12 +1903,12 @@ marker path { stroke: #7F77DD; fill: none; }
 
     const visited = new WeakSet();
     function walk(fiber, depth) {
-      if (!fiber || depth > 50) return null;
+      if (!fiber || depth > 200) return null;
       if (visited.has(fiber)) return null;
       visited.add(fiber);
       try {
         const v = fiber.memoizedProps && fiber.memoizedProps.value;
-        if (v) {
+        if (v && typeof v === 'object') {
           if (typeof v.getQueryCache === 'function') return v;
           if (v.client && typeof v.client.getQueryCache === 'function') return v.client;
         }
@@ -1360,7 +1950,31 @@ marker path { stroke: #7F77DD; fill: none; }
 
       const convData  = treeQuery.state.data;
       const chatTitle = convData.name || 'Claude Chat';
-      const chatMsgs  = (convData.chat_messages || []).sort((a, b) => (a.index || 0) - (b.index || 0));
+      const rawChatMsgs = (convData.chat_messages || []).slice().sort((a, b) => (a.index || 0) - (b.index || 0));
+      const chatMsgs = selectedUuids
+        ? (() => {
+            const filtered = [];
+            let includeAssistantChain = false;
+            for (const msg of rawChatMsgs) {
+              const msgKey = String(msg.uuid || msg.index || '');
+              if (msg.sender === 'human') {
+                includeAssistantChain = selectedUuids.has(msgKey);
+                if (includeAssistantChain) filtered.push(msg);
+                continue;
+              }
+              if (msg.sender === 'assistant') {
+                if (includeAssistantChain) filtered.push(msg);
+                continue;
+              }
+              if (includeAssistantChain) filtered.push(msg);
+            }
+            return filtered;
+          })()
+        : rawChatMsgs;
+
+      if (selectedUuids && chatMsgs.length === 0) {
+        return fail('未选中任何可导出的消息');
+      }
 
       const totalAttachments = chatMsgs.reduce((count, msg) => {
         if (msg.sender !== 'human') return count;

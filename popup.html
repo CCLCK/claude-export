@@ -92,6 +92,19 @@
       cursor: not-allowed;
       transform: none;
     }
+    .btn-secondary {
+      margin-top: 8px;
+      background: linear-gradient(180deg, #f5ece0 0%, #ecdece 100%);
+      color: var(--accent-strong);
+      border-color: var(--border);
+      box-shadow: 0 4px 10px rgba(156, 93, 31, 0.08);
+      font-weight: 600;
+    }
+    .btn-secondary:hover {
+      background: linear-gradient(180deg, #faefe1 0%, #f0dfc8 100%);
+      color: var(--accent-strong);
+      box-shadow: 0 6px 14px rgba(156, 93, 31, 0.12);
+    }
     .options {
       margin: 0 0 14px;
       padding: 12px;
@@ -153,6 +166,32 @@
     }
     #status.error  { color: var(--error); }
     #status.success { color: var(--success); }
+    .select-mode-hint {
+      display: none;
+      margin-top: 10px;
+      padding: 9px 12px;
+      border-radius: 10px;
+      background: #fdf6e3;
+      border: 1px solid #e8d5a3;
+      font-size: 12px;
+      color: #7c4f10;
+      text-align: center;
+      line-height: 1.5;
+    }
+    .select-mode-hint.visible { display: block; }
+    #cancelSelectPageBtn {
+      display: none;
+      margin-top: 8px;
+      background: linear-gradient(180deg, #f0e8d8 0%, #e2d4bc 100%);
+      color: var(--muted);
+      border-color: var(--border);
+      box-shadow: none;
+      font-size: 13px;
+    }
+    #cancelSelectPageBtn:hover {
+      background: linear-gradient(180deg, #f5ece0 0%, #e8d8c0 100%);
+      color: var(--text);
+    }
   </style>
 </head>
 <body>
@@ -167,6 +206,12 @@
           <span class="option-meta">默认关闭。只在你明确想保留 thinking block 时再勾选。</span>
         </span>
       </label>
+      <label class="option-row" for="enableRename" style="margin-top: 10px;">
+        <input id="enableRename" type="checkbox"/>
+        <span>导出时重命名文件
+          <span class="option-meta">勾选后每次导出前弹出输入框，方便按主题命名。</span>
+        </span>
+      </label>
       <div class="option-row option-row--stack" style="margin-top: 12px;">
         <label for="widgetImagePreset">控件图片导出清晰度</label>
         <select id="widgetImagePreset">
@@ -178,6 +223,11 @@
       </div>
     </div>
     <button id="exportBtn">导出为完全离线 HTML</button>
+    <button id="selectMsgBtn" class="btn-secondary">选择消息导出…</button>
+    <div class="select-mode-hint" id="selectModeHint">
+      📌 页面已进入选择模式<br>在对话页面勾选消息后，点击底部「导出选中」按钮
+    </div>
+    <button id="cancelSelectPageBtn" type="button">退出选择模式</button>
     <div id="status"></div>
   </div>
   <script src="popup.js"></script>
