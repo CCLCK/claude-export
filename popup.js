@@ -223,19 +223,11 @@ function removeSelectUI() {
     return { ok: true };
   }
   document.getElementById('__claude-export-toolbar')?.remove();
+  document.getElementById('__claude-export-selection-sidebar')?.remove();
   document.getElementById('__claude-export-select-style')?.remove();
   document.body.classList.remove('__claude-select-mode');
   window.__CLAUDE_EXPORT_SELECT_ACTIVE = false;
-  window.__CLAUDE_EXPORT_PENDING_EXPORT = null;
   return { ok: true };
-}
-
-function readPendingExport() {
-  const pending = window.__CLAUDE_EXPORT_PENDING_EXPORT || null;
-  if (pending) {
-    window.__CLAUDE_EXPORT_PENDING_EXPORT = null;
-  }
-  return pending;
 }
 
 function installSelectUI(config) {
@@ -410,6 +402,111 @@ function installSelectUI(config) {
       background: rgba(163,100,34,.08);
       color: #3f3a33;
     }
+    #__claude-export-selection-sidebar {
+      position: fixed;
+      top: 120px;
+      right: 24px;
+      width: 260px;
+      max-height: calc(100vh - 170px);
+      z-index: 99998;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      border-radius: 18px;
+      border: 1px solid #d8c6ac;
+      background: rgba(250,247,241,.96);
+      box-shadow: 0 12px 30px rgba(114,91,56,.18);
+      backdrop-filter: blur(12px);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    #__ce-selection-sidebar-header {
+      padding: 14px 16px 10px;
+      border-bottom: 1px solid rgba(216,198,172,.7);
+    }
+    #__ce-selection-sidebar-title {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 700;
+      color: #5f513e;
+    }
+    #__ce-selection-sidebar-meta {
+      margin-top: 4px;
+      font-size: 11px;
+      color: #8a7b67;
+    }
+    #__ce-selection-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 12px;
+      overflow-y: auto;
+    }
+    .__ce-selection-item {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      padding: 10px 11px;
+      border-radius: 12px;
+      border: 1px solid rgba(216,198,172,.78);
+      background: rgba(255,252,246,.92);
+      color: #4a4034;
+      cursor: pointer;
+      transition: transform .16s ease, background .16s ease, border-color .16s ease, box-shadow .16s ease;
+    }
+    .__ce-selection-item:hover {
+      transform: translateY(-1px);
+      border-color: rgba(163,100,34,.45);
+      background: #fff9ef;
+      box-shadow: 0 6px 16px rgba(163,100,34,.12);
+    }
+    .__ce-selection-item-badge {
+      width: 24px;
+      height: 24px;
+      flex-shrink: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      background: rgba(163,100,34,.12);
+      color: #915718;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .__ce-selection-item-body {
+      min-width: 0;
+      flex: 1;
+    }
+    .__ce-selection-item-title {
+      margin: 0;
+      font-size: 11px;
+      font-weight: 700;
+      color: #8f5417;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    .__ce-selection-item-preview {
+      margin-top: 4px;
+      font-size: 12px;
+      line-height: 1.45;
+      color: #4a4034;
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 3;
+      overflow: hidden;
+    }
+    #__ce-selection-empty {
+      padding: 18px 12px 8px;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #8a7b67;
+      text-align: center;
+    }
+    @media (max-width: 1400px) {
+      #__claude-export-selection-sidebar {
+        width: 232px;
+        right: 18px;
+      }
+    }
   `;
   document.head.appendChild(style);
 
@@ -435,6 +532,26 @@ function installSelectUI(config) {
     return null;
   }
 
+  function buildPreview(msg, index) {
+    const contentParts = Array.isArray(msg && msg.content) ? msg.content : [];
+    const text = contentParts
+      .filter((part) => part && part.type === 'text')
+      .map((part) => String(part.text || ''))
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const attachCount = ((msg && msg.attachments) || []).length + ((msg && msg.files) || []).length;
+    return {
+      label: `问题 ${index + 1}`,
+      preview: text || (attachCount > 0 ? `[${attachCount} 个附件]` : '（空消息）'),
+    };
+  }
+
+  const messageMetaByUuid = new Map();
+  humanMessages.forEach((msg, index) => {
+    messageMetaByUuid.set(String(msg.uuid || msg.index || index), buildPreview(msg, index));
+  });
+
   const turnData = [];
 
   userMsgEls.forEach((msgEl, index) => {
@@ -451,6 +568,7 @@ function installSelectUI(config) {
     const depth6 = depth5.parentElement;
     const aiSiblingEl = depth6 ? depth6.nextElementSibling : null;
     const uuid = getUuidFromEl(msgEl) || (humanMessages[index] ? String(humanMessages[index].uuid) : `__ce-turn-${index}`);
+    const messageMeta = messageMetaByUuid.get(uuid) || buildPreview(humanMessages[index], index);
 
     const origStyle = {
       display: depth5.style.display,
@@ -484,7 +602,17 @@ function installSelectUI(config) {
       toggle();
     });
 
-    turnData.push({ uuid, depth5, depth6, aiSiblingEl, chk, chkCol, origStyle });
+    turnData.push({
+      uuid,
+      depth5,
+      depth6,
+      aiSiblingEl,
+      chk,
+      chkCol,
+      origStyle,
+      label: messageMeta.label,
+      preview: messageMeta.preview,
+    });
   });
 
   if (turnData.length === 0) {
@@ -502,8 +630,18 @@ function installSelectUI(config) {
   `;
   document.body.appendChild(toolbar);
 
+  const selectionSidebar = document.createElement('aside');
+  selectionSidebar.id = '__claude-export-selection-sidebar';
+  selectionSidebar.innerHTML = `
+    <div id="__ce-selection-sidebar-header">
+      <p id="__ce-selection-sidebar-title">已选消息目录</p>
+      <div id="__ce-selection-sidebar-meta">还没选消息</div>
+    </div>
+    <div id="__ce-selection-list"></div>
+  `;
+  document.body.appendChild(selectionSidebar);
+
   window.__CLAUDE_EXPORT_SELECT_ACTIVE = true;
-  window.__CLAUDE_EXPORT_PENDING_EXPORT = null;
 
   const cleanup = () => {
     turnData.forEach(({ depth5, depth6, aiSiblingEl, chkCol, origStyle }) => {
@@ -516,9 +654,9 @@ function installSelectUI(config) {
       if (aiSiblingEl) aiSiblingEl.classList.remove('__ce-turn-selected');
     });
     toolbar.remove();
+    selectionSidebar.remove();
     style.remove();
     window.__CLAUDE_EXPORT_SELECT_ACTIVE = false;
-    window.__CLAUDE_EXPORT_PENDING_EXPORT = null;
     delete window.__CLAUDE_EXPORT_REMOVE_SELECT_UI;
   };
   window.__CLAUDE_EXPORT_REMOVE_SELECT_UI = cleanup;
@@ -527,13 +665,62 @@ function installSelectUI(config) {
   const exportBtn = toolbar.querySelector('#__ce-toolbar-export');
   const selAllBtn = toolbar.querySelector('#__ce-select-all-btn');
   const cancelBtn = toolbar.querySelector('#__ce-toolbar-cancel');
+  const selectionListEl = selectionSidebar.querySelector('#__ce-selection-list');
+  const selectionMetaEl = selectionSidebar.querySelector('#__ce-selection-sidebar-meta');
 
   const selectedTurns = () => turnData.filter((item) => item.chk.classList.contains('checked'));
+  const updateSelectionSidebar = () => {
+    const selected = selectedTurns();
+    selectionListEl.innerHTML = '';
+    if (selected.length === 0) {
+      selectionMetaEl.textContent = '还没选消息';
+      const empty = document.createElement('div');
+      empty.id = '__ce-selection-empty';
+      empty.textContent = '勾选左侧复选框后，这里会列出你准备导出的 prompt。';
+      selectionListEl.appendChild(empty);
+      return;
+    }
+
+    selectionMetaEl.textContent = `已选 ${selected.length} 条，点击可跳转`;
+    selected.forEach((item, index) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = '__ce-selection-item';
+
+      const badge = document.createElement('span');
+      badge.className = '__ce-selection-item-badge';
+      badge.textContent = String(index + 1);
+
+      const body = document.createElement('span');
+      body.className = '__ce-selection-item-body';
+
+      const title = document.createElement('span');
+      title.className = '__ce-selection-item-title';
+      title.textContent = item.label;
+
+      const preview = document.createElement('span');
+      preview.className = '__ce-selection-item-preview';
+      preview.textContent = item.preview;
+
+      body.appendChild(title);
+      body.appendChild(preview);
+      button.appendChild(badge);
+      button.appendChild(body);
+      button.addEventListener('click', () => {
+        const target = item.depth6 || item.depth5;
+        if (target && typeof target.scrollIntoView === 'function') {
+          target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      });
+      selectionListEl.appendChild(button);
+    });
+  };
   const updateToolbar = () => {
     const checked = selectedTurns();
     countEl.textContent = `已选 ${checked.length} 条`;
     exportBtn.disabled = checked.length === 0;
     selAllBtn.textContent = checked.length === turnData.length ? '取消全选' : '全选';
+    updateSelectionSidebar();
   };
 
   selAllBtn.addEventListener('click', () => {
@@ -551,14 +738,35 @@ function installSelectUI(config) {
   exportBtn.addEventListener('click', async () => {
     const selected = selectedTurns();
     if (selected.length === 0) return;
-    window.__CLAUDE_EXPORT_PENDING_EXPORT = {
-      selectedUuids: selected.map((item) => item.uuid),
-      timestamp: Date.now(),
-    };
-    countEl.textContent = '正在准备导出…';
+    if (!config || !config.runnerUrl || !config.tabId) {
+      countEl.textContent = '导出桥接未就绪，请关闭后重试';
+      return;
+    }
+    countEl.textContent = '正在打开导出窗口…';
     exportBtn.disabled = true;
     selAllBtn.disabled = true;
     cancelBtn.disabled = true;
+    try {
+      const params = new URLSearchParams();
+      params.set('autoExport', '1');
+      params.set('tabId', String(config.tabId));
+      params.set('sourceUrl', String(config.sourceUrl || window.location.href));
+      params.set('selectedUuids', JSON.stringify(selected.map((item) => item.uuid)));
+      params.set('includeThinking', config.includeThinking ? '1' : '0');
+      params.set('enableRename', config.enableRename ? '1' : '0');
+      params.set('widgetPreset', String((config.widgetImageExport && config.widgetImageExport.id) || '300dpi'));
+      const runnerUrl = `${String(config.runnerUrl)}?${params.toString()}`;
+      const runnerWindow = window.open(runnerUrl, '_blank', 'noopener,noreferrer,width=420,height=620');
+      if (!runnerWindow) {
+        throw new Error('浏览器拦截了导出窗口，请允许弹窗后重试');
+      }
+      cleanup();
+    } catch (error) {
+      countEl.textContent = `导出失败：${error.message || error}`;
+      exportBtn.disabled = false;
+      selAllBtn.disabled = false;
+      cancelBtn.disabled = false;
+    }
   });
 
   requestAnimationFrame(() => {
@@ -587,7 +795,6 @@ const selectMsgBtn = document.getElementById('selectMsgBtn');
 const statusEl = document.getElementById('status');
 const selectModeHint = document.getElementById('selectModeHint');
 const cancelSelectPageBtn = document.getElementById('cancelSelectPageBtn');
-let pendingExportPollTimer = null;
 
 function setStatus(message, type = '') {
   if (!statusEl) return;
@@ -598,13 +805,6 @@ function setStatus(message, type = '') {
 function setSelectModeHint(visible) {
   if (selectModeHint) selectModeHint.classList.toggle('visible', Boolean(visible));
   if (cancelSelectPageBtn) cancelSelectPageBtn.style.display = visible ? '' : 'none';
-}
-
-function stopPendingExportPoll() {
-  if (pendingExportPollTimer) {
-    clearInterval(pendingExportPollTimer);
-    pendingExportPollTimer = null;
-  }
 }
 
 async function getActiveClaudeTab() {
@@ -627,7 +827,7 @@ async function maybeResolveBaseName(tabId, defaultBaseName, enableRename) {
   return value == null ? null : sanitizeBaseName(value) || defaultBaseName;
 }
 
-async function runExport(tab, { selectedUuids = null } = {}) {
+async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAfterSuccess = false } = {}) {
   const includeThinking = Boolean(document.getElementById('includeThinking')?.checked);
   const enableRename = Boolean(document.getElementById('enableRename')?.checked);
   const widgetImageExport = normalizeWidgetImagePreset(widgetImagePresetSelect?.value || DEFAULT_WIDGET_IMAGE_PRESET);
@@ -700,44 +900,26 @@ async function runExport(tab, { selectedUuids = null } = {}) {
     const md = buildObsidianMarkdown({
       title: title || 'Claude Chat',
       htmlFileName,
-      sourceUrl: tab.url,
+      sourceUrl: sourceUrl || tab.url,
       promptSummaries: Array.isArray(payload.promptSummaries) ? payload.promptSummaries : [],
     });
     triggerDownload(html, htmlFileName, 'text/html;charset=utf-8');
     await new Promise((resolve) => setTimeout(resolve, 150));
     triggerDownload(md, mdFileName, 'text/markdown;charset=utf-8');
     setStatus('✅ 已导出 HTML + Obsidian 模板', 'success');
+    if (closeAfterSuccess) {
+      setTimeout(() => {
+        try {
+          window.close();
+        } catch (error) {
+        }
+      }, 900);
+    }
   } catch (error) {
     setStatus(`导出失败：${error.message || error}`, 'error');
   } finally {
     exportBtn.disabled = false;
     if (selectMsgBtn) selectMsgBtn.disabled = false;
-  }
-}
-
-async function resumePendingExportIfAny() {
-  try {
-    const tab = await getActiveClaudeTab();
-    const [result] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: readPendingExport,
-      world: 'MAIN',
-    });
-    const pending = result && result.result;
-    if (!pending || !Array.isArray(pending.selectedUuids) || pending.selectedUuids.length === 0) {
-      return false;
-    }
-    stopPendingExportPoll();
-    setSelectModeHint(false);
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: removeSelectUI,
-      world: 'MAIN',
-    });
-    await runExport(tab, { selectedUuids: pending.selectedUuids });
-    return true;
-  } catch (error) {
-    return false;
   }
 }
 
@@ -773,6 +955,9 @@ if (selectMsgBtn) {
           includeThinking,
           enableRename,
           widgetImageExport,
+          runnerUrl: chrome.runtime.getURL('popup.html'),
+          tabId: tab.id,
+          sourceUrl: tab.url,
         }],
         world: 'MAIN',
       });
@@ -784,33 +969,6 @@ if (selectMsgBtn) {
 
       setSelectModeHint(true);
       setStatus(payload.alreadyActive ? '页面已处于选择模式' : `✅ 已进入选择模式，可选 ${payload.count} 条用户消息`, 'success');
-
-      stopPendingExportPoll();
-      pendingExportPollTimer = setInterval(async () => {
-        try {
-          const [res] = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            func: readPendingExport,
-            world: 'MAIN',
-          });
-          const pending = res && res.result;
-          if (!pending) return;
-
-          stopPendingExportPoll();
-          setSelectModeHint(false);
-          selectMsgBtn.disabled = false;
-
-          await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            func: removeSelectUI,
-            world: 'MAIN',
-          });
-
-          await runExport(tab, { selectedUuids: pending.selectedUuids });
-        } catch (error) {
-          stopPendingExportPoll();
-        }
-      }, 400);
     } catch (error) {
       setStatus(error.message || String(error), 'error');
       selectMsgBtn.disabled = false;
@@ -821,7 +979,6 @@ if (selectMsgBtn) {
 if (cancelSelectPageBtn) {
   cancelSelectPageBtn.addEventListener('click', async () => {
     try {
-      stopPendingExportPoll();
       const tab = await getActiveClaudeTab();
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
@@ -837,7 +994,62 @@ if (cancelSelectPageBtn) {
   });
 }
 
-void resumePendingExportIfAny();
+function parseAutoExportRequest() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('autoExport') !== '1') return null;
+  const tabId = Number(params.get('tabId'));
+  if (!Number.isFinite(tabId) || tabId <= 0) return null;
+  let selectedUuids = [];
+  try {
+    const raw = params.get('selectedUuids');
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(parsed)) {
+      selectedUuids = parsed.map((value) => String(value)).filter(Boolean);
+    }
+  } catch (error) {
+    selectedUuids = [];
+  }
+  return {
+    tabId,
+    sourceUrl: params.get('sourceUrl') || 'https://claude.ai',
+    includeThinking: params.get('includeThinking') === '1',
+    enableRename: params.get('enableRename') === '1',
+    widgetPreset: params.get('widgetPreset') || DEFAULT_WIDGET_IMAGE_PRESET,
+    selectedUuids,
+  };
+}
+
+async function maybeRunAutoExportFromQuery() {
+  const request = parseAutoExportRequest();
+  if (!request) return false;
+
+  if (document.getElementById('includeThinking')) {
+    document.getElementById('includeThinking').checked = request.includeThinking;
+  }
+  if (document.getElementById('enableRename')) {
+    document.getElementById('enableRename').checked = request.enableRename;
+  }
+  if (widgetImagePresetSelect) {
+    widgetImagePresetSelect.value = normalizeWidgetImagePreset(request.widgetPreset).id;
+  }
+
+  exportBtn.disabled = true;
+  if (selectMsgBtn) selectMsgBtn.disabled = true;
+  setSelectModeHint(false);
+  setStatus('正在接管选中消息导出…');
+
+  await runExport(
+    { id: request.tabId, url: request.sourceUrl },
+    {
+      selectedUuids: request.selectedUuids,
+      sourceUrl: request.sourceUrl,
+      closeAfterSuccess: true,
+    }
+  );
+  return true;
+}
+
+void maybeRunAutoExportFromQuery();
 
 // =====================================================================
 // 以下函数在页面上下文（claude.ai）中执行
