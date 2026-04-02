@@ -44,7 +44,7 @@ function triggerDownload(content, fileName, mime) {
 }
 
 const WIDGET_IMAGE_PRESET_KEY = 'claude-export-widget-image-preset';
-const SELECTION_RUNNER_WINDOW_KEY = 'claude-export-selection-runner-window-id';
+const SELECTION_RUNNER_TAB_KEY = 'claude-export-selection-runner-tab-id';
 const DEFAULT_WIDGET_IMAGE_PRESET = '300dpi';
 
 function normalizeWidgetImagePreset(preset) {
@@ -74,9 +74,9 @@ function saveWidgetImagePresetId(preset) {
   }
 }
 
-function loadSelectionRunnerWindowId() {
+function loadSelectionRunnerTabId() {
   try {
-    const raw = localStorage.getItem(SELECTION_RUNNER_WINDOW_KEY);
+    const raw = localStorage.getItem(SELECTION_RUNNER_TAB_KEY);
     const value = Number(raw);
     return Number.isFinite(value) && value > 0 ? value : null;
   } catch (error) {
@@ -84,17 +84,17 @@ function loadSelectionRunnerWindowId() {
   }
 }
 
-function clearSelectionRunnerWindowId() {
+function clearSelectionRunnerTabId() {
   try {
-    localStorage.removeItem(SELECTION_RUNNER_WINDOW_KEY);
+    localStorage.removeItem(SELECTION_RUNNER_TAB_KEY);
   } catch (error) {
     // Ignore popup-local persistence failures.
   }
 }
 
-function saveSelectionRunnerWindowId(windowId) {
+function saveSelectionRunnerTabId(tabId) {
   try {
-    localStorage.setItem(SELECTION_RUNNER_WINDOW_KEY, String(windowId));
+    localStorage.setItem(SELECTION_RUNNER_TAB_KEY, String(tabId));
   } catch (error) {
     // Ignore popup-local persistence failures.
   }
@@ -851,20 +851,20 @@ async function maybeResolveBaseName(tabId, defaultBaseName, enableRename) {
   return value == null ? null : sanitizeBaseName(value) || defaultBaseName;
 }
 
-async function closeStoredSelectionRunnerWindow() {
-  const windowId = loadSelectionRunnerWindowId();
-  if (!windowId) return;
+async function closeStoredSelectionRunnerTab() {
+  const tabId = loadSelectionRunnerTabId();
+  if (!tabId) return;
   try {
-    await chrome.windows.remove(windowId);
+    await chrome.tabs.remove(tabId);
   } catch (error) {
-    // Window may already be gone.
+    // Tab may already be gone.
   } finally {
-    clearSelectionRunnerWindowId();
+    clearSelectionRunnerTabId();
   }
 }
 
-async function startSelectionRunnerWindow(tab, { includeThinking, enableRename, widgetImageExport }) {
-  await closeStoredSelectionRunnerWindow();
+async function startSelectionRunnerTab(tab, { includeThinking, enableRename, widgetImageExport }) {
+  await closeStoredSelectionRunnerTab();
   const params = new URLSearchParams();
   params.set('selectionRunner', '1');
   params.set('tabId', String(tab.id));
@@ -873,19 +873,18 @@ async function startSelectionRunnerWindow(tab, { includeThinking, enableRename, 
   params.set('enableRename', enableRename ? '1' : '0');
   params.set('widgetPreset', String((widgetImageExport && widgetImageExport.id) || DEFAULT_WIDGET_IMAGE_PRESET));
   const runnerUrl = `${chrome.runtime.getURL('popup.html')}?${params.toString()}`;
-  const runnerWindow = await chrome.windows.create({
+  const runnerTab = await chrome.tabs.create({
     url: runnerUrl,
-    type: 'popup',
-    focused: false,
-    state: 'minimized',
-    width: 420,
-    height: 620,
+    active: false,
+    windowId: tab.windowId,
+    index: typeof tab.index === 'number' ? tab.index + 1 : undefined,
+    openerTabId: tab.id,
   });
-  if (!runnerWindow || !runnerWindow.id) {
-    throw new Error('后台导出窗口创建失败，请重试');
+  if (!runnerTab || !runnerTab.id) {
+    throw new Error('后台导出标签页创建失败，请重试');
   }
-  saveSelectionRunnerWindowId(runnerWindow.id);
-  return runnerWindow;
+  saveSelectionRunnerTabId(runnerTab.id);
+  return runnerTab;
 }
 
 async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAfterSuccess = false } = {}) {
@@ -969,10 +968,17 @@ async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAft
     triggerDownload(md, mdFileName, 'text/markdown;charset=utf-8');
     setStatus('✅ 已导出 HTML + Obsidian 模板', 'success');
     if (closeAfterSuccess) {
-      clearSelectionRunnerWindowId();
+      clearSelectionRunnerTabId();
       setTimeout(() => {
         try {
-          window.close();
+          chrome.tabs.getCurrent((currentTab) => {
+            if (chrome.runtime.lastError) return;
+            if (currentTab && currentTab.id) {
+              chrome.tabs.remove(currentTab.id);
+              return;
+            }
+            window.close();
+          });
         } catch (error) {
         }
       }, 900);
@@ -1029,12 +1035,12 @@ if (selectMsgBtn) {
         throw new Error(payload && payload.error ? payload.error : '注入选择模式失败');
       }
 
-      await startSelectionRunnerWindow(tab, { includeThinking, enableRename, widgetImageExport });
+      await startSelectionRunnerTab(tab, { includeThinking, enableRename, widgetImageExport });
       setSelectModeHint(true);
       setStatus(payload.alreadyActive ? '页面已处于选择模式，后台导出已待命' : `✅ 已进入选择模式，可选 ${payload.count} 条用户消息`, 'success');
     } catch (error) {
       try {
-        await closeStoredSelectionRunnerWindow();
+        await closeStoredSelectionRunnerTab();
         if (tab) {
           await chrome.scripting.executeScript({
             target: { tabId: tab.id },
@@ -1055,7 +1061,7 @@ if (cancelSelectPageBtn) {
   cancelSelectPageBtn.addEventListener('click', async () => {
     try {
       const tab = await getActiveClaudeTab();
-      await closeStoredSelectionRunnerWindow();
+      await closeStoredSelectionRunnerTab();
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: removeSelectUI,
@@ -1114,7 +1120,7 @@ async function maybeRunSelectionRunnerFromQuery() {
       });
       state = result && result.result;
     } catch (error) {
-      clearSelectionRunnerWindowId();
+      clearSelectionRunnerTabId();
       setStatus('导出失败：无法连接到 Claude 页面', 'error');
       return true;
     }
@@ -1142,8 +1148,15 @@ async function maybeRunSelectionRunnerFromQuery() {
     if (!state || !state.active) {
       idlePolls += 1;
       if (idlePolls >= 2) {
-        clearSelectionRunnerWindowId();
-        window.close();
+        clearSelectionRunnerTabId();
+        chrome.tabs.getCurrent((currentTab) => {
+          if (chrome.runtime.lastError) return;
+          if (currentTab && currentTab.id) {
+            chrome.tabs.remove(currentTab.id);
+            return;
+          }
+          window.close();
+        });
         return true;
       }
     } else {
