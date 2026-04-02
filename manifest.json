@@ -1,9 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Claude 聊天记录导出（离线版）",
-  "version": "1.4",
+  "version": "1.5",
   "description": "将 Claude 聊天记录导出为完全离线可用的 HTML，控件内联不依赖远端",
-  "permissions": ["activeTab", "scripting"],
+  "permissions": ["activeTab", "scripting", "downloads", "storage"],
+  "web_accessible_resources": [
+    {
+      "resources": ["pretext.min.js"],
+      "matches": ["<all_urls>"]
+    }
+  ],
   "action": {
     "default_popup": "popup.html",
     "default_title": "导出聊天记录"

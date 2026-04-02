@@ -31,21 +31,48 @@ function yamlQuoted(value) {
     .replace(/"/g, '\\"')}"`;
 }
 
-function triggerDownload(content, fileName, mime) {
+async function triggerDownload(content, fileName, mime) {
   const blob = new Blob([content], { type: mime });
   const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = fileName;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  try {
+    if (chrome.downloads && typeof chrome.downloads.download === 'function') {
+      await new Promise((resolve, reject) => {
+        chrome.downloads.download({
+          url,
+          filename: fileName,
+          saveAs: false,
+          conflictAction: 'uniquify',
+        }, (downloadId) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+            return;
+          }
+          if (!downloadId) {
+            reject(new Error('浏览器未返回下载任务'));
+            return;
+          }
+          resolve(downloadId);
+        });
+      });
+      return;
+    }
+
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
 }
 
 const WIDGET_IMAGE_PRESET_KEY = 'claude-export-widget-image-preset';
 const SELECTION_RUNNER_TAB_KEY = 'claude-export-selection-runner-tab-id';
+const DEBUG_LOG_KEY = 'claude-export-debug-log';
 const DEFAULT_WIDGET_IMAGE_PRESET = '300dpi';
+let pretextBundlePromise = null;
 
 function normalizeWidgetImagePreset(preset) {
   const value = String(preset || '').toLowerCase();
@@ -100,6 +127,82 @@ function saveSelectionRunnerTabId(tabId) {
   }
 }
 
+async function loadPretextBundleText() {
+  if (!pretextBundlePromise) {
+    pretextBundlePromise = (async () => {
+      try {
+        const url = chrome.runtime.getURL('pretext.min.js');
+        const resp = await fetch(url);
+        if (!resp.ok) return '';
+        return String(await resp.text() || '').replace(/<\/script/gi, '<\\/script');
+      } catch (error) {
+        return '';
+      }
+    })();
+  }
+  return pretextBundlePromise;
+}
+
+function stringifyDebugDetail(detail) {
+  if (detail == null) return '';
+  if (typeof detail === 'string') return detail.slice(0, 1200);
+  try {
+    return JSON.stringify(detail).slice(0, 1200);
+  } catch (error) {
+    return String(detail).slice(0, 1200);
+  }
+}
+
+async function appendDebugLog(source, event, detail = null) {
+  try {
+    if (!chrome.storage || !chrome.storage.local) return;
+    const payload = {
+      at: new Date().toISOString(),
+      source: String(source || 'popup'),
+      event: String(event || 'event'),
+      detail: stringifyDebugDetail(detail),
+    };
+    const current = await new Promise((resolve) => {
+      chrome.storage.local.get([DEBUG_LOG_KEY], (result) => {
+        if (chrome.runtime.lastError) {
+          resolve([]);
+          return;
+        }
+        resolve(Array.isArray(result && result[DEBUG_LOG_KEY]) ? result[DEBUG_LOG_KEY] : []);
+      });
+    });
+    const next = current.concat(payload).slice(-400);
+    await new Promise((resolve) => {
+      chrome.storage.local.set({ [DEBUG_LOG_KEY]: next }, () => resolve());
+    });
+  } catch (error) {
+    // 临时日志失败不能反向影响主流程。
+  }
+}
+
+function readPageDebugLog() {
+  const store = Array.isArray(window.__CLAUDE_EXPORT_PAGE_DEBUG) ? window.__CLAUDE_EXPORT_PAGE_DEBUG.slice() : [];
+  window.__CLAUDE_EXPORT_PAGE_DEBUG = [];
+  return store;
+}
+
+async function flushPageDebugLog(tabId, fallbackSource = 'page') {
+  if (!tabId) return;
+  try {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: readPageDebugLog,
+      world: 'MAIN',
+    });
+    const logs = Array.isArray(result && result.result) ? result.result : [];
+    for (const entry of logs) {
+      await appendDebugLog(entry.source || fallbackSource, entry.event || 'page-log', entry.detail || '');
+    }
+  } catch (error) {
+    await appendDebugLog('popup', 'flush-page-debug-failed', { tabId, error: error.message || String(error) });
+  }
+}
+
 function readExportProgress(runId) {
   const key = String(runId || '');
   if (!key) return null;
@@ -114,6 +217,27 @@ function formatMarkdownBlockquote(text) {
     .map((line) => line.trimEnd());
   const safeLines = lines.length > 0 ? lines : [''];
   return safeLines.map((line) => `> ${line || ' '}`).join('\n');
+}
+
+function joinTextContentParts(parts, separator = '\n') {
+  const blocks = Array.isArray(parts)
+    ? parts
+        .filter((part) => part && part.type === 'text')
+        .map((part) => String(part.text || ''))
+        .filter((part) => part.length > 0)
+    : [];
+  let combined = '';
+  for (const block of blocks) {
+    if (!combined) {
+      combined = block;
+      continue;
+    }
+    const prevEndsWithWhitespace = /[\s\n]$/.test(combined);
+    const nextStartsWithWhitespace = /^[\s\n]/.test(block);
+    combined += (prevEndsWithWhitespace || nextStartsWithWhitespace) ? '' : separator;
+    combined += block;
+  }
+  return combined;
 }
 
 function escapeMarkdownHeadingText(text) {
@@ -169,6 +293,47 @@ ${promptSummarySection ? `${promptSummarySection}\n` : ''}## 说明
 
 // ── 提取消息摘要列表（在页面上下文执行）────────────────────────
 function extractMessageList() {
+  const debugStore = window.__CLAUDE_EXPORT_PAGE_DEBUG = Array.isArray(window.__CLAUDE_EXPORT_PAGE_DEBUG)
+    ? window.__CLAUDE_EXPORT_PAGE_DEBUG
+    : [];
+  const pushDebug = (event, detail = null) => {
+    let safeDetail = '';
+    try {
+      safeDetail = typeof detail === 'string' ? detail : JSON.stringify(detail || '');
+    } catch (error) {
+      safeDetail = String(detail || '');
+    }
+    debugStore.push({
+      at: new Date().toISOString(),
+      source: 'extractMessageList',
+      event,
+      detail: safeDetail.slice(0, 1200),
+    });
+    if (debugStore.length > 200) debugStore.splice(0, debugStore.length - 200);
+  };
+  pushDebug('start');
+
+  function joinTextContentPartsLocal(parts, separator = '\n') {
+    const blocks = Array.isArray(parts)
+      ? parts
+          .filter((part) => part && part.type === 'text')
+          .map((part) => String(part.text || ''))
+          .filter((part) => part.length > 0)
+      : [];
+    let combined = '';
+    for (const block of blocks) {
+      if (!combined) {
+        combined = block;
+        continue;
+      }
+      const prevEndsWithWhitespace = /[\s\n]$/.test(combined);
+      const nextStartsWithWhitespace = /^[\s\n]/.test(block);
+      combined += (prevEndsWithWhitespace || nextStartsWithWhitespace) ? '' : separator;
+      combined += block;
+    }
+    return combined;
+  }
+
   function findQueryClient() {
     const root = document.getElementById('root');
     if (!root) return null;
@@ -193,7 +358,10 @@ function extractMessageList() {
 
   const currentChatUuid = window.location.pathname.split('/').pop();
   const qc = findQueryClient();
-  if (!qc) return { error: 'React Query Client 未找到，请确保页面已完整加载' };
+  if (!qc) {
+    pushDebug('no-query-client');
+    return { error: 'React Query Client 未找到，请确保页面已完整加载' };
+  }
 
   const allQueries = qc.getQueryCache().getAll();
   const treeQuery = allQueries.find((q) =>
@@ -201,6 +369,7 @@ function extractMessageList() {
     && q.state.data && q.state.data.chat_messages
   );
   if (!treeQuery || !treeQuery.state.data) {
+    pushDebug('no-tree-query');
     return { error: '对话数据未找到，请确保页面已完整加载' };
   }
 
@@ -208,16 +377,13 @@ function extractMessageList() {
     .slice()
     .sort((a, b) => (a.index || 0) - (b.index || 0));
 
-  return {
+  const payload = {
     title: treeQuery.state.data.name || 'Claude Chat',
     messages: msgs
       .filter((msg) => msg.sender === 'human')
       .map((msg) => {
         const contentParts = Array.isArray(msg.content) ? msg.content : [];
-        const text = contentParts
-          .filter((c) => c.type === 'text')
-          .map((c) => c.text || '')
-          .join('')
+        const text = joinTextContentPartsLocal(contentParts, '\n')
           .replace(/\s+/g, ' ')
           .trim()
           .slice(0, 80);
@@ -231,6 +397,8 @@ function extractMessageList() {
         };
       }),
   };
+  pushDebug('success', { title: payload.title, count: payload.messages.length });
+  return payload;
 }
 
 function askFileNameOnPage(defaultName) {
@@ -270,8 +438,49 @@ function readSelectExportState() {
 }
 
 function installSelectUI(config) {
+  const debugStore = window.__CLAUDE_EXPORT_PAGE_DEBUG = Array.isArray(window.__CLAUDE_EXPORT_PAGE_DEBUG)
+    ? window.__CLAUDE_EXPORT_PAGE_DEBUG
+    : [];
+  const pushDebug = (event, detail = null) => {
+    let safeDetail = '';
+    try {
+      safeDetail = typeof detail === 'string' ? detail : JSON.stringify(detail || '');
+    } catch (error) {
+      safeDetail = String(detail || '');
+    }
+    debugStore.push({
+      at: new Date().toISOString(),
+      source: 'installSelectUI',
+      event,
+      detail: safeDetail.slice(0, 1200),
+    });
+    if (debugStore.length > 200) debugStore.splice(0, debugStore.length - 200);
+  };
+  pushDebug('start', { tabId: config && config.tabId });
   if (window.__CLAUDE_EXPORT_SELECT_ACTIVE) {
+    pushDebug('already-active');
     return { ok: true, alreadyActive: true };
+  }
+
+  function joinTextContentPartsLocal(parts, separator = '\n') {
+    const blocks = Array.isArray(parts)
+      ? parts
+          .filter((part) => part && part.type === 'text')
+          .map((part) => String(part.text || ''))
+          .filter((part) => part.length > 0)
+      : [];
+    let combined = '';
+    for (const block of blocks) {
+      if (!combined) {
+        combined = block;
+        continue;
+      }
+      const prevEndsWithWhitespace = /[\s\n]$/.test(combined);
+      const nextStartsWithWhitespace = /^[\s\n]/.test(block);
+      combined += (prevEndsWithWhitespace || nextStartsWithWhitespace) ? '' : separator;
+      combined += block;
+    }
+    return combined;
   }
 
   function findQueryClient() {
@@ -573,10 +782,7 @@ function installSelectUI(config) {
 
   function buildPreview(msg, index) {
     const contentParts = Array.isArray(msg && msg.content) ? msg.content : [];
-    const text = contentParts
-      .filter((part) => part && part.type === 'text')
-      .map((part) => String(part.text || ''))
-      .join(' ')
+    const text = joinTextContentPartsLocal(contentParts, '\n')
       .replace(/\s+/g, ' ')
       .trim();
     const attachCount = ((msg && msg.attachments) || []).length + ((msg && msg.files) || []).length;
@@ -656,6 +862,7 @@ function installSelectUI(config) {
 
   if (turnData.length === 0) {
     style.remove();
+    pushDebug('no-selectable-nodes');
     return { ok: false, error: '未找到可选择的用户消息节点，请确保当前页面已完整加载' };
   }
 
@@ -684,6 +891,7 @@ function installSelectUI(config) {
   window.__CLAUDE_EXPORT_PENDING_EXPORT = null;
 
   const cleanup = () => {
+    pushDebug('cleanup');
     turnData.forEach(({ depth5, depth6, aiSiblingEl, chkCol, origStyle }) => {
       depth5.classList.remove('__ce-user-row');
       depth5.style.display = origStyle.display;
@@ -787,6 +995,7 @@ function installSelectUI(config) {
       selectedUuids: selected.map((item) => item.uuid),
       timestamp: Date.now(),
     };
+    pushDebug('queue-export', { selected: selected.length });
     countEl.textContent = '正在导出中…';
     exportBtn.disabled = true;
     selAllBtn.disabled = true;
@@ -803,6 +1012,7 @@ function installSelectUI(config) {
   });
 
   updateToolbar();
+  pushDebug('ready', { selectableCount: turnData.length });
   return { ok: true, alreadyActive: false, count: turnData.length };
 }
 
@@ -816,6 +1026,7 @@ if (widgetImagePresetSelect) {
 
 const exportBtn = document.getElementById('exportBtn');
 const selectMsgBtn = document.getElementById('selectMsgBtn');
+const openDebugLogBtn = document.getElementById('openDebugLogBtn');
 const statusEl = document.getElementById('status');
 const selectModeHint = document.getElementById('selectModeHint');
 const cancelSelectPageBtn = document.getElementById('cancelSelectPageBtn');
@@ -884,6 +1095,7 @@ async function startSelectionRunnerTab(tab, { includeThinking, enableRename, wid
     throw new Error('后台导出标签页创建失败，请重试');
   }
   saveSelectionRunnerTabId(runnerTab.id);
+  await appendDebugLog('popup', 'runner-tab-created', { runnerTabId: runnerTab.id, sourceTabId: tab.id });
   return runnerTab;
 }
 
@@ -891,7 +1103,13 @@ async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAft
   const includeThinking = Boolean(document.getElementById('includeThinking')?.checked);
   const enableRename = Boolean(document.getElementById('enableRename')?.checked);
   const widgetImageExport = normalizeWidgetImagePreset(widgetImagePresetSelect?.value || DEFAULT_WIDGET_IMAGE_PRESET);
+  const pretextBundle = await loadPretextBundleText();
   saveWidgetImagePresetId(widgetImageExport.id);
+  await appendDebugLog('popup', 'run-export-start', {
+    tabId: tab && tab.id,
+    selectedCount: Array.isArray(selectedUuids) ? selectedUuids.length : 0,
+    closeAfterSuccess,
+  });
 
   exportBtn.disabled = true;
   if (selectMsgBtn) selectMsgBtn.disabled = true;
@@ -932,7 +1150,7 @@ async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAft
     const exportPromise = chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: extractAndBuild,
-      args: [runId, { includeThinking, widgetImageExport, selectedUuids }],
+      args: [runId, { includeThinking, widgetImageExport, selectedUuids, pretextBundle }],
       world: 'MAIN',
     });
     pollTimer = setInterval(pollProgress, 350);
@@ -947,6 +1165,7 @@ async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAft
     const payload = results && results[0] && results[0].result;
     const { html, title, error } = payload || {};
     if (error) {
+      await flushPageDebugLog(tab.id, 'extractAndBuild');
       throw new Error(error);
     }
     const defaultBaseName = sanitizeBaseName(`${title || 'claude-chat'}_${formatLocalTimestamp()}`);
@@ -963,9 +1182,10 @@ async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAft
       sourceUrl: sourceUrl || tab.url,
       promptSummaries: Array.isArray(payload.promptSummaries) ? payload.promptSummaries : [],
     });
-    triggerDownload(html, htmlFileName, 'text/html;charset=utf-8');
+    await triggerDownload(html, htmlFileName, 'text/html;charset=utf-8');
     await new Promise((resolve) => setTimeout(resolve, 150));
-    triggerDownload(md, mdFileName, 'text/markdown;charset=utf-8');
+    await triggerDownload(md, mdFileName, 'text/markdown;charset=utf-8');
+    await appendDebugLog('popup', 'run-export-success', { htmlFileName, mdFileName, title: title || 'Claude Chat' });
     setStatus('✅ 已导出 HTML + Obsidian 模板', 'success');
     if (closeAfterSuccess) {
       clearSelectionRunnerTabId();
@@ -984,6 +1204,11 @@ async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAft
       }, 900);
     }
   } catch (error) {
+    await appendDebugLog('popup', 'run-export-failed', {
+      tabId: tab && tab.id,
+      error: error.message || String(error),
+    });
+    await flushPageDebugLog(tab && tab.id, 'page');
     setStatus(`导出失败：${error.message || error}`, 'error');
   } finally {
     exportBtn.disabled = false;
@@ -995,8 +1220,10 @@ if (exportBtn) {
   exportBtn.addEventListener('click', async () => {
     try {
       const tab = await getActiveClaudeTab();
+      await appendDebugLog('popup', 'full-export-click', { tabId: tab.id });
       await runExport(tab);
     } catch (error) {
+      await appendDebugLog('popup', 'full-export-click-failed', { error: error.message || String(error) });
       setStatus(error.message || String(error), 'error');
       exportBtn.disabled = false;
       if (selectMsgBtn) selectMsgBtn.disabled = false;
@@ -1009,6 +1236,7 @@ if (selectMsgBtn) {
     let tab = null;
     try {
       tab = await getActiveClaudeTab();
+      await appendDebugLog('popup', 'select-mode-click', { tabId: tab.id });
       const includeThinking = Boolean(document.getElementById('includeThinking')?.checked);
       const enableRename = Boolean(document.getElementById('enableRename')?.checked);
       const widgetImageExport = normalizeWidgetImagePreset(widgetImagePresetSelect?.value || DEFAULT_WIDGET_IMAGE_PRESET);
@@ -1032,10 +1260,16 @@ if (selectMsgBtn) {
 
       const payload = result && result.result;
       if (!payload || !payload.ok) {
+        await flushPageDebugLog(tab.id, 'installSelectUI');
         throw new Error(payload && payload.error ? payload.error : '注入选择模式失败');
       }
 
       await startSelectionRunnerTab(tab, { includeThinking, enableRename, widgetImageExport });
+      await appendDebugLog('popup', 'select-mode-ready', {
+        tabId: tab.id,
+        count: payload.count || 0,
+        alreadyActive: Boolean(payload.alreadyActive),
+      });
       setSelectModeHint(true);
       setStatus(payload.alreadyActive ? '页面已处于选择模式，后台导出已待命' : `✅ 已进入选择模式，可选 ${payload.count} 条用户消息`, 'success');
     } catch (error) {
@@ -1050,6 +1284,11 @@ if (selectMsgBtn) {
         }
       } catch (cleanupError) {
       }
+      await appendDebugLog('popup', 'select-mode-failed', {
+        tabId: tab && tab.id,
+        error: error.message || String(error),
+      });
+      if (tab) await flushPageDebugLog(tab.id, 'installSelectUI');
       setSelectModeHint(false);
       setStatus(error.message || String(error), 'error');
       selectMsgBtn.disabled = false;
@@ -1061,6 +1300,7 @@ if (cancelSelectPageBtn) {
   cancelSelectPageBtn.addEventListener('click', async () => {
     try {
       const tab = await getActiveClaudeTab();
+      await appendDebugLog('popup', 'select-mode-cancel', { tabId: tab.id });
       await closeStoredSelectionRunnerTab();
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
@@ -1093,6 +1333,7 @@ function parseSelectionRunnerRequest() {
 async function maybeRunSelectionRunnerFromQuery() {
   const request = parseSelectionRunnerRequest();
   if (!request) return false;
+  await appendDebugLog('runner', 'runner-ready', request);
 
   if (document.getElementById('includeThinking')) {
     document.getElementById('includeThinking').checked = request.includeThinking;
@@ -1120,12 +1361,14 @@ async function maybeRunSelectionRunnerFromQuery() {
       });
       state = result && result.result;
     } catch (error) {
+      await appendDebugLog('runner', 'read-select-state-failed', { error: error.message || String(error) });
       clearSelectionRunnerTabId();
       setStatus('导出失败：无法连接到 Claude 页面', 'error');
       return true;
     }
 
     if (state && state.pending && Array.isArray(state.pending.selectedUuids) && state.pending.selectedUuids.length > 0) {
+      await appendDebugLog('runner', 'pending-export-detected', { selectedCount: state.pending.selectedUuids.length });
       try {
         await chrome.scripting.executeScript({
           target: { tabId: request.tabId },
@@ -1167,6 +1410,12 @@ async function maybeRunSelectionRunnerFromQuery() {
   return true;
 }
 
+if (openDebugLogBtn) {
+  openDebugLogBtn.addEventListener('click', () => {
+    window.open(chrome.runtime.getURL('debug-log.html'), '_blank');
+  });
+}
+
 void maybeRunSelectionRunnerFromQuery();
 
 // =====================================================================
@@ -1175,9 +1424,48 @@ void maybeRunSelectionRunnerFromQuery();
 function extractAndBuild(runId, options) {
   const exportRunId = String(runId || `claude-export-${Date.now()}`);
   const includeThinking = Boolean(options && options.includeThinking);
+  const pretextBundle = String((options && options.pretextBundle) || '');
   const selectedUuids = Array.isArray(options && options.selectedUuids) && options.selectedUuids.length > 0
     ? new Set(options.selectedUuids.map((value) => String(value)))
     : null;
+  const debugStore = window.__CLAUDE_EXPORT_PAGE_DEBUG = Array.isArray(window.__CLAUDE_EXPORT_PAGE_DEBUG)
+    ? window.__CLAUDE_EXPORT_PAGE_DEBUG
+    : [];
+  const pushDebug = (event, detail = null) => {
+    let safeDetail = '';
+    try {
+      safeDetail = typeof detail === 'string' ? detail : JSON.stringify(detail || '');
+    } catch (error) {
+      safeDetail = String(detail || '');
+    }
+    debugStore.push({
+      at: new Date().toISOString(),
+      source: 'extractAndBuild',
+      event,
+      detail: safeDetail.slice(0, 1200),
+    });
+    if (debugStore.length > 300) debugStore.splice(0, debugStore.length - 300);
+  };
+  function joinTextContentPartsLocal(parts, separator = '\n') {
+    const blocks = Array.isArray(parts)
+      ? parts
+          .filter((part) => part && part.type === 'text')
+          .map((part) => String(part.text || ''))
+          .filter((part) => part.length > 0)
+      : [];
+    let combined = '';
+    for (const block of blocks) {
+      if (!combined) {
+        combined = block;
+        continue;
+      }
+      const prevEndsWithWhitespace = /[\s\n]$/.test(combined);
+      const nextStartsWithWhitespace = /^[\s\n]/.test(block);
+      combined += (prevEndsWithWhitespace || nextStartsWithWhitespace) ? '' : separator;
+      combined += block;
+    }
+    return combined;
+  }
   const normalizeWidgetImageExport = (value) => {
     const preset = value && typeof value === 'object' ? value : {};
     const scale = Number(preset.scale);
@@ -1208,11 +1496,17 @@ function extractAndBuild(runId, options) {
   };
   const fail = (error) => {
     const message = `提取失败：${error}`;
+    pushDebug('fail', { error: String(error || '') });
     setProgress({ state: 'error', stage: 'error', message });
     scheduleProgressCleanup();
     return { html: null, title: '', error };
   };
 
+  pushDebug('start', {
+    includeThinking,
+    selectedCount: selectedUuids ? selectedUuids.size : 0,
+    hasPretextBundle: Boolean(pretextBundle),
+  });
   setProgress({ state: 'running', stage: 'extract', message: '正在提取聊天记录…', completed: 0, total: 0 });
 
   // ── 工具：HTML 转义 ──────────────────────────────────────────────
@@ -1820,6 +2114,10 @@ function extractAndBuild(runId, options) {
     return `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m5 12.5 4.2 4.2L19 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>`;
   }
 
+  function chevronIconSvg() {
+    return `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m9 6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"></path></svg>`;
+  }
+
   function summarizePromptPreview(text) {
     const compact = String(text || '')
       .replace(/\s+/g, ' ')
@@ -2364,6 +2662,11 @@ marker path { stroke: #7F77DD; fill: none; }
       if (selectedUuids && chatMsgs.length === 0) {
         return fail('未选中任何可导出的消息');
       }
+      pushDebug('messages-ready', {
+        rawCount: rawChatMsgs.length,
+        exportCount: chatMsgs.length,
+        selectedCount: selectedUuids ? selectedUuids.size : 0,
+      });
 
       const totalAttachments = chatMsgs.reduce((count, msg) => {
         if (msg.sender !== 'human') return count;
@@ -2371,6 +2674,7 @@ marker path { stroke: #7F77DD; fill: none; }
       }, 0);
       let completedAttachments = 0;
       if (totalAttachments > 0) {
+        pushDebug('attachments-start', { totalAttachments });
         setProgress({
           state: 'running',
           stage: 'attachments',
@@ -2449,6 +2753,7 @@ marker path { stroke: #7F77DD; fill: none; }
         total: totalAttachments,
         message: '正在构建离线 HTML…',
       });
+      pushDebug('render-start', { attachmentEntries: attachmentEntries.length });
 
       const attMap = {};
       attachmentEntries.forEach(att => {
@@ -2461,15 +2766,24 @@ marker path { stroke: #7F77DD; fill: none; }
     const promptTocItems = [];
     const promptSummaries = [];
     const widgetTocItems = [];
+    let pendingUserExchange = null;
+    let exchangeCounter = 0;
+
+    function flushPendingUserExchange() {
+      if (!pendingUserExchange) return;
+      turnsHtml.push(`
+<div class="exchange exchange--solo" data-exchange-id="${pendingUserExchange.exchangeId}">
+  ${pendingUserExchange.userHtml}
+</div>`);
+      pendingUserExchange = null;
+    }
 
     for (const msg of chatMsgs) {
       // 用户消息
       if (msg.sender === 'human') {
+        flushPendingUserExchange();
         const contentParts = Array.isArray(msg.content) ? msg.content : [];
-        const rawTextContent = contentParts
-          .filter(c => c.type === 'text')
-          .map(c => c.text || '')
-          .join('');
+        const rawTextContent = joinTextContentPartsLocal(contentParts, '\n');
         const textContent = await inlineTextAssetUrls(rawTextContent);
 
         const messageKey = String(msg.uuid || msg.index || turnsHtml.length)
@@ -2487,6 +2801,7 @@ marker path { stroke: #7F77DD; fill: none; }
           id: promptSectionId,
           title: promptLabel,
           preview: promptPreview,
+          raw: rawTextContent,
         });
         promptSummaries.push({
           label: promptPreview,
@@ -2523,18 +2838,25 @@ marker path { stroke: #7F77DD; fill: none; }
   ${promptActionHtml}
 </div>`
           : '';
-        turnsHtml.push(`
+        const exchangeId = `exchange-${exchangeCounter++}`;
+        const userSectionHtml = `
 <section id="${promptSectionId}" class="prompt-section">
   <div class="turn user-turn">
     <div class="avatar ua" aria-hidden="true"></div>
-    <div class="bubble ub">
-      ${attachHtml}
-      <div class="md user-text">${md2html(textContent)}</div>
+    <div class="turn-stack turn-stack--user">
+      <div class="bubble ub">
+        ${attachHtml}
+        <div class="md user-text">${md2html(textContent)}</div>
+      </div>
       ${userMetaHtml}
       ${dialogHtml}
     </div>
   </div>
-</section>`);
+</section>`;
+        pendingUserExchange = {
+          exchangeId,
+          userHtml: userSectionHtml,
+        };
         continue;
       }
 
@@ -2640,15 +2962,73 @@ marker path { stroke: #7F77DD; fill: none; }
   ${replyActionHtml}
 </div>`
             : '';
-          turnsHtml.push(`
-<div class="turn claude-turn">
-  <div class="avatar ca">C</div>
-  <div class="bubble cb">${parts.join('\n')}${assistantMetaHtml}</div>
+          if (pendingUserExchange) {
+            const replyWrapId = `reply-${pendingUserExchange.exchangeId}`;
+            const replyHtml = `
+<div class="turn claude-turn reply-shell">
+  <div class="reply-side">
+    <div class="avatar ca">C</div>
+    <button
+      type="button"
+      class="reply-toggle"
+      data-reply-toggle="${replyWrapId}"
+      aria-expanded="true"
+      aria-label="折叠回复"
+      title="折叠回复"
+    >${chevronIconSvg()}</button>
+  </div>
+  <div
+    id="${replyWrapId}"
+    class="reply-wrap"
+    data-state="expanded"
+    data-raw="${escHtml(assistantCopyText)}"
+    data-widget-count="${widgetIndex}"
+  >
+    <div class="bubble cb">${parts.join('\n')}${assistantMetaHtml}</div>
+  </div>
+</div>`;
+            turnsHtml.push(`
+<div class="exchange exchange--paired" data-exchange-id="${pendingUserExchange.exchangeId}">
+  ${pendingUserExchange.userHtml}
+  ${replyHtml}
 </div>`);
+            pendingUserExchange = null;
+          } else {
+            const standaloneReplyId = `reply-exchange-${exchangeCounter}`;
+            const replyHtml = `
+<div class="turn claude-turn reply-shell">
+  <div class="reply-side">
+    <div class="avatar ca">C</div>
+    <button
+      type="button"
+      class="reply-toggle"
+      data-reply-toggle="${standaloneReplyId}"
+      aria-expanded="true"
+      aria-label="折叠回复"
+      title="折叠回复"
+    >${chevronIconSvg()}</button>
+  </div>
+  <div
+    id="${standaloneReplyId}"
+    class="reply-wrap"
+    data-state="expanded"
+    data-raw="${escHtml(assistantCopyText)}"
+    data-widget-count="${widgetIndex}"
+  >
+    <div class="bubble cb">${parts.join('\n')}${assistantMetaHtml}</div>
+  </div>
+</div>`;
+            turnsHtml.push(`
+<div class="exchange exchange--assistant-only" data-exchange-id="exchange-${exchangeCounter++}">
+  ${replyHtml}
+</div>`);
+          }
         }
         continue;
       }
     }
+
+    flushPendingUserExchange();
 
   // ── 页面样式 ─────────────────────────────────────────────────────
   const PAGE_CSS = `
@@ -2667,6 +3047,18 @@ body {
 /* ── 整体容器 ── */
 .chat-container { max-width: 780px; margin: 0 auto; }
 
+/* ── 问答配对容器 ── */
+.exchange {
+  contain: layout style;
+}
+.exchange.is-virtualized {
+  contain: layout style paint;
+}
+.exchange + .exchange {
+  border-top: 1px solid #ece9e3;
+  margin-top: 4px;
+}
+
 /* ── 标题 ── */
 .chat-title {
   font-size: 22px; font-weight: 700; color: #1a1a1a;
@@ -2682,11 +3074,14 @@ body {
   padding: 20px 0;
 }
 .user-turn { flex-direction: row-reverse; }
-
-/* 轮次分隔线（Claude 回复后） */
-.claude-turn + .user-turn {
-  border-top: 1px solid #ece9e3;
-  margin-top: 4px;
+.turn-stack {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.turn-stack--user {
+  flex: 1;
+  align-items: flex-end;
 }
 
 /* ── 头像 ── */
@@ -2817,7 +3212,8 @@ body {
 }
 .turn-meta--user {
   justify-content: flex-end;
-  margin-top: 10px;
+  margin-top: 8px;
+  padding-right: 4px;
 }
 .turn-meta--assistant .turn-time {
   margin-top: 0;
@@ -3093,6 +3489,74 @@ body {
   display: none;
 }
 
+/* ── Claude 回复折叠 ── */
+.reply-wrap {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  transition: height .28s cubic-bezier(.4,0,.2,1), opacity .22s ease;
+}
+.reply-shell {
+  align-items: flex-start;
+}
+.reply-side {
+  flex-shrink: 0;
+  width: 34px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+.reply-wrap[data-state="expanded"] {
+  opacity: 1;
+}
+.reply-wrap[data-state="animating"] {
+  opacity: 1;
+}
+.reply-wrap[data-state="collapsed"] {
+  height: 0 !important;
+  opacity: 0;
+  pointer-events: none;
+}
+.reply-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  border: 1px solid #e3ddd4;
+  border-radius: 999px;
+  background: #f7f3ec;
+  color: #736657;
+  line-height: 1;
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease, transform .15s ease;
+}
+.reply-toggle:hover {
+  background: #f0e9de;
+  color: #564839;
+  transform: translateY(-1px);
+}
+.reply-toggle svg {
+  width: 16px;
+  height: 16px;
+  color: currentColor;
+  transition: transform .22s ease;
+}
+.reply-toggle[aria-expanded="true"] svg {
+  transform: rotate(90deg);
+}
+.reply-toggle[aria-expanded="false"] svg {
+  transform: rotate(0deg);
+}
+.reply-toggle:focus-visible {
+  outline: 2px solid rgba(163,100,34,.35);
+  outline-offset: 2px;
+}
+
 /* ── 右侧目录 ── */
 .toc-panel { display: none; }
 
@@ -3162,6 +3626,7 @@ body {
     border-radius: 12px;
     color: #44403c;
     text-decoration: none;
+    overflow: hidden;
     transition: background .15s ease, color .15s ease, transform .15s ease;
   }
 
@@ -3200,6 +3665,8 @@ body {
     flex-direction: column;
     gap: 3px;
     min-width: 0;
+    overflow-wrap: anywhere;
+    word-break: break-word;
   }
 
   .toc-label {
@@ -3214,9 +3681,8 @@ body {
     font-size: 12px;
     line-height: 1.45;
     word-break: break-word;
-    display: -webkit-box;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 3;
+    display: block;
+    white-space: pre-line;
     overflow: hidden;
   }
 }
@@ -3235,7 +3701,7 @@ body {
 @media (prefers-color-scheme: dark) {
   body { background: #1a1917; color: #e8e4dc; }
   .chat-title { color: #f0ece4; border-bottom-color: #3a3830; }
-  .claude-turn + .user-turn { border-top-color: #3a3830; }
+  .exchange + .exchange { border-top-color: #3a3830; }
   .ub { background: #2c2a26; color: #e8e4dc; }
   .turn-time { color: #9b9489; }
   .md p code, .md li code { background: rgba(255,255,255,.1); color: #d4d0c8; border-color: rgba(255,255,255,.15); }
@@ -3270,6 +3736,12 @@ body {
   .toc-index { background: #38342f; color: #d6d3d1; }
   .toc-link.is-active .toc-index { background: #5a4a20; color: #f4d38a; }
   .toc-label { color: #bfae97; }
+  .reply-toggle {
+    background: #2c2a26;
+    border-color: #3d3420;
+    color: #d6d3d1;
+  }
+  .reply-toggle:hover { background: #38342f; color: #fff4db; }
   .turn-icon-btn { color: #b5b0a8; }
   .turn-icon-btn:hover { background: #2c2a26; color: #f0ece4; }
   .code-block-copy { color: #d6cfbf; }
@@ -3282,6 +3754,12 @@ body {
 let pageHeightRaf = 0;
 const widgetCaptureRequests = new Map();
 const widgetImageExport = ${widgetImageExportLiteral};
+const pt = window.__pretext || null;
+const textLayoutCanvas = document.createElement('canvas');
+const textLayoutContext = textLayoutCanvas.getContext('2d');
+const graphemeSegmenter = typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function'
+  ? new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+  : null;
 
 function sanitizeExportName(raw) {
   const cleaned = String(raw || 'widget')
@@ -3291,6 +3769,254 @@ function sanitizeExportName(raw) {
     .replace(/\\.+$/g, '')
     .slice(0, 80);
   return cleaned || 'widget';
+}
+
+function segmentText(text) {
+  const value = String(text || '');
+  if (!value) return [];
+  if (graphemeSegmenter) {
+    return Array.from(graphemeSegmenter.segment(value), (part) => part.segment);
+  }
+  return Array.from(value);
+}
+
+function trimTextToWidthWithEllipsis(text, width, font) {
+  const raw = String(text || '').replace(/\\s+$/g, '');
+  if (!raw) return '…';
+  if (!textLayoutContext) return raw + '…';
+  textLayoutContext.font = font;
+  const ellipsis = '…';
+  let value = raw;
+  while (value && textLayoutContext.measureText(value + ellipsis).width > width) {
+    value = value.slice(0, -1);
+  }
+  return (value || '').replace(/\\s+$/g, '') + ellipsis;
+}
+
+function measureWrappedTextWithPretext(text, maxWidth, options = {}) {
+  if (!pt || typeof pt.prepare !== 'function' || typeof pt.layout !== 'function') return null;
+  const value = String(text || '').replace(/\\r\\n/g, '\\n');
+  const width = Math.max(8, Number(maxWidth || 0));
+  const font = options.font || '16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+  const lineHeight = Math.max(1, Number(options.lineHeight || 24));
+  const maxLines = Math.max(1, Number(options.maxLines || Number.POSITIVE_INFINITY));
+
+  try {
+    if (Number.isFinite(maxLines) && maxLines < Number.POSITIVE_INFINITY && typeof pt.prepareWithSegments === 'function' && typeof pt.layoutWithLines === 'function') {
+      const prepared = pt.prepareWithSegments(value, font);
+      const result = pt.layoutWithLines(prepared, width, lineHeight);
+      const rawLines = Array.isArray(result.lines) ? result.lines.map((line) => String(line && typeof line.text === 'string' ? line.text : '')) : [];
+      const truncated = rawLines.length > maxLines;
+      const lines = rawLines.slice(0, maxLines);
+      if (truncated && lines.length) {
+        lines[lines.length - 1] = trimTextToWidthWithEllipsis(lines[lines.length - 1], width, font);
+      }
+      return {
+        lines,
+        lineCount: lines.length,
+        height: Math.ceil(lines.length * lineHeight),
+        truncated,
+      };
+    }
+
+    const prepared = pt.prepare(value, font);
+    const result = pt.layout(prepared, width, lineHeight);
+    return {
+      lines: [],
+      lineCount: Math.max(1, Number(result.lineCount || 0)),
+      height: Math.ceil(Number(result.height || lineHeight)),
+      truncated: false,
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+function measureWrappedText(text, maxWidth, options = {}) {
+  const pretextResult = measureWrappedTextWithPretext(text, maxWidth, options);
+  if (pretextResult) return pretextResult;
+
+  const value = String(text || '').replace(/\\r\\n/g, '\\n');
+  const width = Math.max(8, Number(maxWidth || 0));
+  const font = options.font || '16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+  const lineHeight = Math.max(1, Number(options.lineHeight || 24));
+  const maxLines = Math.max(1, Number(options.maxLines || Number.POSITIVE_INFINITY));
+
+  if (!textLayoutContext) {
+    const fallback = value ? [value] : [];
+    return {
+      lines: fallback.slice(0, maxLines),
+      lineCount: Math.min(fallback.length, maxLines),
+      height: Math.min(fallback.length, maxLines) * lineHeight,
+      truncated: fallback.length > maxLines,
+    };
+  }
+
+  textLayoutContext.font = font;
+  const paragraphs = value.split('\\n');
+  const lines = [];
+  let truncated = false;
+
+  const pushLine = (line) => {
+    if (lines.length >= maxLines) {
+      truncated = true;
+      return false;
+    }
+    lines.push(line);
+    return true;
+  };
+
+  const finalizeWithEllipsis = () => {
+    if (!lines.length) return;
+    const ellipsis = '…';
+    let last = lines[lines.length - 1].replace(/\\s+$/g, '');
+    while (last && textLayoutContext.measureText(last + ellipsis).width > width) {
+      last = last.slice(0, -1);
+    }
+    lines[lines.length - 1] = (last || '').replace(/\\s+$/g, '') + ellipsis;
+  };
+
+  for (let pIndex = 0; pIndex < paragraphs.length; pIndex += 1) {
+    const paragraph = paragraphs[pIndex];
+    if (!paragraph) {
+      if (!pushLine('')) break;
+      continue;
+    }
+    const segments = segmentText(paragraph);
+    let current = '';
+    for (let i = 0; i < segments.length; i += 1) {
+      const next = current + segments[i];
+      if (!current || textLayoutContext.measureText(next).width <= width) {
+        current = next;
+        continue;
+      }
+      if (!pushLine(current.replace(/\\s+$/g, ''))) break;
+      current = segments[i].trimStart();
+      if (lines.length >= maxLines) break;
+    }
+    if (lines.length >= maxLines) {
+      truncated = true;
+      break;
+    }
+    if (!pushLine(current.replace(/\\s+$/g, ''))) {
+      truncated = true;
+      break;
+    }
+  }
+
+  if (truncated) {
+    finalizeWithEllipsis();
+  }
+
+  return {
+    lines,
+    lineCount: lines.length,
+    height: lines.length * lineHeight,
+    truncated,
+  };
+}
+
+function updatePromptTocPreviews() {
+  document.querySelectorAll('.toc-preview[data-raw-preview]').forEach((node) => {
+    const raw = node.dataset.rawPreview || node.textContent || '';
+    const style = window.getComputedStyle(node);
+    const width = node.clientWidth || parseFloat(style.width) || 120;
+    const font = style.font || style.fontStyle + ' ' + style.fontVariant + ' ' + style.fontWeight + ' ' + style.fontSize + ' / ' + style.lineHeight + ' ' + style.fontFamily;
+    const lineHeight = parseFloat(style.lineHeight) || (parseFloat(style.fontSize) || 12) * 1.45;
+    const preview = measureWrappedText(raw, width, {
+      font,
+      lineHeight,
+      maxLines: 3,
+    });
+    node.textContent = preview.lines.join('\\n');
+  });
+}
+
+function estimateReplyExpandedHeight(wrap, containerWidth) {
+  if (!wrap) return 160;
+  const widthBase = Number(containerWidth || wrap.getBoundingClientRect().width || 0);
+  const replyWidth = widthBase || Math.max(260, (document.querySelector('.chat-container')?.getBoundingClientRect().width || 780) - 82);
+  let estimated = 44;
+  const rawText = wrap.dataset.raw || '';
+
+  if (rawText.trim()) {
+    const mdNode = wrap.querySelector('.md');
+    const style = window.getComputedStyle(mdNode || document.body);
+    const font = style.font || '16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    const lineHeight = parseFloat(style.lineHeight) || 28;
+    const result = measureWrappedText(rawText, Math.max(120, replyWidth - 16), {
+      font,
+      lineHeight,
+      maxLines: Number.POSITIVE_INFINITY,
+    });
+    estimated += result.height;
+  }
+
+  estimated += wrap.querySelectorAll('.code-block').length * 180;
+  estimated += wrap.querySelectorAll('.widget-wrapper').length * 380;
+  estimated += wrap.querySelectorAll('.thinking-block').length * 130;
+  estimated += wrap.querySelectorAll('table').length * 130;
+
+  return Math.max(estimated, 140);
+}
+
+function estimateExchangeHeight(exchange) {
+  const containerWidth = document.querySelector('.chat-container')?.getBoundingClientRect().width || 780;
+  let estimated = 96;
+
+  const userText = exchange.querySelector('.user-text');
+  if (userText) {
+    const style = window.getComputedStyle(userText);
+    const font = style.font || '15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    const lineHeight = parseFloat(style.lineHeight) || 27;
+    const width = userText.closest('.bubble')?.getBoundingClientRect().width
+      || Math.max(240, containerWidth * 0.84 - 32);
+    const result = measureWrappedText(userText.textContent || '', width - 28, {
+      font,
+      lineHeight,
+      maxLines: 4000,
+    });
+    estimated += result.height + 42;
+  }
+
+  const attachments = exchange.querySelectorAll('.attachments .att-tag, .attachments .att-button').length;
+  if (attachments > 0) {
+    estimated += Math.ceil(attachments / 2) * 28;
+  }
+
+  const replyWrap = exchange.querySelector('.reply-wrap');
+  if (replyWrap && replyWrap.dataset.state !== 'collapsed') {
+    const replyWidth = replyWrap.getBoundingClientRect().width || Math.max(260, containerWidth - 82);
+    estimated += estimateReplyExpandedHeight(replyWrap, replyWidth);
+  }
+
+  return Math.max(estimated, 140);
+}
+
+function syncExchangeIntrinsicSize(exchange) {
+  if (!exchange || !exchange.classList.contains('is-virtualized')) return;
+  const height = Math.max(Math.ceil(exchange.getBoundingClientRect().height), estimateExchangeHeight(exchange));
+  exchange.style.containIntrinsicSize = 'auto ' + height + 'px';
+}
+
+function setupLongConversationVirtualization() {
+  const exchanges = Array.from(document.querySelectorAll('.exchange'));
+  if (exchanges.length < 40 || !CSS.supports('content-visibility', 'auto')) return;
+
+  exchanges.forEach((exchange) => {
+    exchange.classList.add('is-virtualized');
+    exchange.style.contentVisibility = 'auto';
+    exchange.style.contain = 'layout style paint';
+    exchange.style.containIntrinsicSize = 'auto ' + estimateExchangeHeight(exchange) + 'px';
+  });
+
+  if (typeof ResizeObserver !== 'undefined') {
+    const exchangeResizeObserver = new ResizeObserver((entries) => {
+      entries.forEach((entry) => syncExchangeIntrinsicSize(entry.target));
+      queuePageHeightPost();
+    });
+    exchanges.forEach((exchange) => exchangeResizeObserver.observe(exchange));
+  }
 }
 
 function measurePageHeight() {
@@ -3393,6 +4119,95 @@ async function copyAttachmentText(sourceId, trigger) {
   return copyTextContent(text, trigger);
 }
 
+function getReplyToggleForWrap(wrap) {
+  if (!wrap || !wrap.id) return null;
+  return document.querySelector('[data-reply-toggle="' + wrap.id + '"]');
+}
+
+function syncReplyToggle(toggle, expanded) {
+  if (!toggle) return;
+  toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+  const label = expanded ? '折叠回复' : '展开回复';
+  toggle.setAttribute('aria-label', label);
+  toggle.setAttribute('title', label);
+}
+
+function setReplyWrapExpanded(wrap, expanded, options = {}) {
+  if (!wrap) return;
+  const immediate = Boolean(options.immediate);
+  const toggle = getReplyToggleForWrap(wrap);
+  const exchange = wrap.closest('.exchange');
+
+  if (wrap.__replyTransitionHandler) {
+    wrap.removeEventListener('transitionend', wrap.__replyTransitionHandler);
+    wrap.__replyTransitionHandler = null;
+  }
+
+  if (expanded) {
+    syncReplyToggle(toggle, true);
+    const estimatedHeight = pt ? estimateReplyExpandedHeight(wrap, wrap.getBoundingClientRect().width) : 0;
+    const fallbackHeight = (!pt && !immediate) ? Math.ceil(wrap.scrollHeight) : 0;
+    const targetHeight = Math.max(Math.ceil(estimatedHeight || 0), fallbackHeight, 0);
+    wrap.dataset.state = immediate ? 'expanded' : 'animating';
+    wrap.style.opacity = '1';
+    if (immediate) {
+      wrap.style.height = 'auto';
+      syncExchangeIntrinsicSize(exchange);
+      queuePageHeightPost();
+      return;
+    }
+    wrap.style.height = '0px';
+    requestAnimationFrame(() => {
+      wrap.style.height = targetHeight + 'px';
+    });
+    const onExpandEnd = (event) => {
+      if (event.propertyName !== 'height') return;
+      wrap.dataset.state = 'expanded';
+      wrap.style.height = 'auto';
+      wrap.style.opacity = '1';
+      wrap.removeEventListener('transitionend', onExpandEnd);
+      wrap.__replyTransitionHandler = null;
+      syncExchangeIntrinsicSize(exchange);
+      queuePageHeightPost();
+    };
+    wrap.__replyTransitionHandler = onExpandEnd;
+    wrap.addEventListener('transitionend', onExpandEnd);
+    return;
+  }
+
+  syncReplyToggle(toggle, false);
+  const currentHeight = Math.max(
+    Math.ceil(wrap.getBoundingClientRect().height),
+    Math.ceil(wrap.scrollHeight),
+    0
+  );
+  wrap.style.opacity = '1';
+  if (immediate) {
+    wrap.dataset.state = 'collapsed';
+    wrap.style.height = '0px';
+    wrap.style.opacity = '0';
+    syncExchangeIntrinsicSize(exchange);
+    queuePageHeightPost();
+    return;
+  }
+  wrap.style.height = currentHeight + 'px';
+  wrap.dataset.state = 'animating';
+  requestAnimationFrame(() => {
+    wrap.dataset.state = 'collapsed';
+    wrap.style.height = '0px';
+    wrap.style.opacity = '0';
+  });
+  const onCollapseEnd = (event) => {
+    if (event.propertyName !== 'height') return;
+    wrap.removeEventListener('transitionend', onCollapseEnd);
+    wrap.__replyTransitionHandler = null;
+    syncExchangeIntrinsicSize(exchange);
+    queuePageHeightPost();
+  };
+  wrap.__replyTransitionHandler = onCollapseEnd;
+  wrap.addEventListener('transitionend', onCollapseEnd);
+}
+
 function findWidgetFrame(frameId) {
   return Array.from(document.querySelectorAll('.widget-iframe')).find((el) => el.dataset.iframeId === frameId) || null;
 }
@@ -3476,11 +4291,32 @@ async function downloadWidgetImage(frameId, widgetTitle, trigger) {
 document.addEventListener('click', (event) => {
   const tocLink = event.target.closest('.toc-link');
   if (tocLink) {
+    const targetId = tocLink.dataset.targetId || '';
+    const targetSection = targetId ? document.getElementById(targetId) : null;
+    const collapsedReply = targetSection ? targetSection.closest('.reply-wrap[data-state="collapsed"]') : null;
+    if (collapsedReply) {
+      event.preventDefault();
+      setReplyWrapExpanded(collapsedReply, true);
+      setTimeout(() => {
+        targetSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 220);
+    }
     const tocPanel = tocLink.closest('.toc-panel');
     if (tocPanel) {
       tocPanel.querySelectorAll('.toc-link').forEach((link) => link.classList.remove('is-active'));
     }
     tocLink.classList.add('is-active');
+    return;
+  }
+
+  const replyToggle = event.target.closest('[data-reply-toggle]');
+  if (replyToggle) {
+    const wrap = document.getElementById(replyToggle.dataset.replyToggle || '');
+    if (wrap) {
+      const expanded = replyToggle.getAttribute('aria-expanded') === 'true';
+      setReplyWrapExpanded(wrap, !expanded);
+    }
+    return;
   }
 
   const widgetMenuToggle = event.target.closest('[data-widget-menu-toggle]');
@@ -3606,11 +4442,23 @@ if (typeof IntersectionObserver !== 'undefined') {
 }
 
 window.addEventListener('load', () => {
+  document.querySelectorAll('.reply-wrap').forEach((wrap) => {
+    const expanded = wrap.dataset.state !== 'collapsed';
+    setReplyWrapExpanded(wrap, expanded, { immediate: true });
+  });
+  updatePromptTocPreviews();
+  setupLongConversationVirtualization();
   postPageHeight();
   setTimeout(postPageHeight, 100);
   setTimeout(postPageHeight, 500);
 });
-window.addEventListener('resize', postPageHeight);
+window.addEventListener('resize', () => {
+  updatePromptTocPreviews();
+  document.querySelectorAll('.exchange.is-virtualized').forEach((exchange) => {
+    exchange.style.containIntrinsicSize = 'auto ' + estimateExchangeHeight(exchange) + 'px';
+  });
+  postPageHeight();
+});
 document.addEventListener('readystatechange', postPageHeight);
 postPageHeight();
 `;
@@ -3626,7 +4474,7 @@ postPageHeight();
         <span class="toc-index">${index + 1}</span>
         <span class="toc-text">
           <span class="toc-label">${escHtml(item.title)}</span>
-          <span class="toc-preview">${escHtml(item.preview || item.title)}</span>
+          <span class="toc-preview" data-raw-preview="${escHtml((item.raw || item.preview || item.title || '').replace(/\s+/g, ' ').trim())}">${escHtml(item.preview || item.title)}</span>
         </span>
       </a>`).join('')}
     </nav>
@@ -3647,6 +4495,16 @@ postPageHeight();
   </aside>`
         : '';
 
+      const pretextScriptHtml = pretextBundle
+        ? `
+  <script>
+${pretextBundle}
+window.__pretext = (typeof pretextExports !== 'undefined' && pretextExports)
+  ? pretextExports
+  : (window.__pretext || null);
+<\/script>`
+        : '';
+
       const fullHtml = `<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -3662,7 +4520,8 @@ postPageHeight();
     <h1 class="chat-title">💬 ${escHtml(chatTitle)}</h1>
     ${turnsHtml.join('\n')}
   </div>
-  <script>${PAGE_SCRIPT}</script>
+  ${pretextScriptHtml}
+  <script>${PAGE_SCRIPT}<\/script>
 </body>
 </html>`;
 
@@ -3672,6 +4531,12 @@ postPageHeight();
         completed: completedAttachments,
         total: totalAttachments,
         message: '✅ 导出成功！',
+      });
+      pushDebug('success', {
+        title: chatTitle,
+        turnCount: turnsHtml.length,
+        promptCount: promptTocItems.length,
+        widgetCount: widgetTocItems.length,
       });
       scheduleProgressCleanup();
       return { html: fullHtml, title: chatTitle, promptSummaries };
