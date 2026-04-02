@@ -7,11 +7,5 @@
   "action": {
     "default_popup": "popup.html",
     "default_title": "导出聊天记录"
-  },
-  "web_accessible_resources": [
-    {
-      "resources": ["popup.html", "popup.js"],
-      "matches": ["https://claude.ai/*"]
-    }
-  ]
+  }
 }

@@ -44,6 +44,7 @@ function triggerDownload(content, fileName, mime) {
 }
 
 const WIDGET_IMAGE_PRESET_KEY = 'claude-export-widget-image-preset';
+const SELECTION_RUNNER_WINDOW_KEY = 'claude-export-selection-runner-window-id';
 const DEFAULT_WIDGET_IMAGE_PRESET = '300dpi';
 
 function normalizeWidgetImagePreset(preset) {
@@ -68,6 +69,32 @@ function loadWidgetImagePresetId() {
 function saveWidgetImagePresetId(preset) {
   try {
     localStorage.setItem(WIDGET_IMAGE_PRESET_KEY, normalizeWidgetImagePreset(preset).id);
+  } catch (error) {
+    // Ignore popup-local persistence failures.
+  }
+}
+
+function loadSelectionRunnerWindowId() {
+  try {
+    const raw = localStorage.getItem(SELECTION_RUNNER_WINDOW_KEY);
+    const value = Number(raw);
+    return Number.isFinite(value) && value > 0 ? value : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function clearSelectionRunnerWindowId() {
+  try {
+    localStorage.removeItem(SELECTION_RUNNER_WINDOW_KEY);
+  } catch (error) {
+    // Ignore popup-local persistence failures.
+  }
+}
+
+function saveSelectionRunnerWindowId(windowId) {
+  try {
+    localStorage.setItem(SELECTION_RUNNER_WINDOW_KEY, String(windowId));
   } catch (error) {
     // Ignore popup-local persistence failures.
   }
@@ -227,7 +254,19 @@ function removeSelectUI() {
   document.getElementById('__claude-export-select-style')?.remove();
   document.body.classList.remove('__claude-select-mode');
   window.__CLAUDE_EXPORT_SELECT_ACTIVE = false;
+  window.__CLAUDE_EXPORT_PENDING_EXPORT = null;
   return { ok: true };
+}
+
+function readSelectExportState() {
+  const pending = window.__CLAUDE_EXPORT_PENDING_EXPORT || null;
+  if (pending) {
+    window.__CLAUDE_EXPORT_PENDING_EXPORT = null;
+  }
+  return {
+    active: Boolean(window.__CLAUDE_EXPORT_SELECT_ACTIVE),
+    pending,
+  };
 }
 
 function installSelectUI(config) {
@@ -642,6 +681,7 @@ function installSelectUI(config) {
   document.body.appendChild(selectionSidebar);
 
   window.__CLAUDE_EXPORT_SELECT_ACTIVE = true;
+  window.__CLAUDE_EXPORT_PENDING_EXPORT = null;
 
   const cleanup = () => {
     turnData.forEach(({ depth5, depth6, aiSiblingEl, chkCol, origStyle }) => {
@@ -657,6 +697,7 @@ function installSelectUI(config) {
     selectionSidebar.remove();
     style.remove();
     window.__CLAUDE_EXPORT_SELECT_ACTIVE = false;
+    window.__CLAUDE_EXPORT_PENDING_EXPORT = null;
     delete window.__CLAUDE_EXPORT_REMOVE_SELECT_UI;
   };
   window.__CLAUDE_EXPORT_REMOVE_SELECT_UI = cleanup;
@@ -738,35 +779,18 @@ function installSelectUI(config) {
   exportBtn.addEventListener('click', async () => {
     const selected = selectedTurns();
     if (selected.length === 0) return;
-    if (!config || !config.runnerUrl || !config.tabId) {
+    if (!config || !config.tabId) {
       countEl.textContent = '导出桥接未就绪，请关闭后重试';
       return;
     }
-    countEl.textContent = '正在打开导出窗口…';
+    window.__CLAUDE_EXPORT_PENDING_EXPORT = {
+      selectedUuids: selected.map((item) => item.uuid),
+      timestamp: Date.now(),
+    };
+    countEl.textContent = '正在导出中…';
     exportBtn.disabled = true;
     selAllBtn.disabled = true;
     cancelBtn.disabled = true;
-    try {
-      const params = new URLSearchParams();
-      params.set('autoExport', '1');
-      params.set('tabId', String(config.tabId));
-      params.set('sourceUrl', String(config.sourceUrl || window.location.href));
-      params.set('selectedUuids', JSON.stringify(selected.map((item) => item.uuid)));
-      params.set('includeThinking', config.includeThinking ? '1' : '0');
-      params.set('enableRename', config.enableRename ? '1' : '0');
-      params.set('widgetPreset', String((config.widgetImageExport && config.widgetImageExport.id) || '300dpi'));
-      const runnerUrl = `${String(config.runnerUrl)}?${params.toString()}`;
-      const runnerWindow = window.open(runnerUrl, '_blank', 'noopener,noreferrer,width=420,height=620');
-      if (!runnerWindow) {
-        throw new Error('浏览器拦截了导出窗口，请允许弹窗后重试');
-      }
-      cleanup();
-    } catch (error) {
-      countEl.textContent = `导出失败：${error.message || error}`;
-      exportBtn.disabled = false;
-      selAllBtn.disabled = false;
-      cancelBtn.disabled = false;
-    }
   });
 
   requestAnimationFrame(() => {
@@ -825,6 +849,43 @@ async function maybeResolveBaseName(tabId, defaultBaseName, enableRename) {
   });
   const value = result && result.result;
   return value == null ? null : sanitizeBaseName(value) || defaultBaseName;
+}
+
+async function closeStoredSelectionRunnerWindow() {
+  const windowId = loadSelectionRunnerWindowId();
+  if (!windowId) return;
+  try {
+    await chrome.windows.remove(windowId);
+  } catch (error) {
+    // Window may already be gone.
+  } finally {
+    clearSelectionRunnerWindowId();
+  }
+}
+
+async function startSelectionRunnerWindow(tab, { includeThinking, enableRename, widgetImageExport }) {
+  await closeStoredSelectionRunnerWindow();
+  const params = new URLSearchParams();
+  params.set('selectionRunner', '1');
+  params.set('tabId', String(tab.id));
+  params.set('sourceUrl', String(tab.url || 'https://claude.ai'));
+  params.set('includeThinking', includeThinking ? '1' : '0');
+  params.set('enableRename', enableRename ? '1' : '0');
+  params.set('widgetPreset', String((widgetImageExport && widgetImageExport.id) || DEFAULT_WIDGET_IMAGE_PRESET));
+  const runnerUrl = `${chrome.runtime.getURL('popup.html')}?${params.toString()}`;
+  const runnerWindow = await chrome.windows.create({
+    url: runnerUrl,
+    type: 'popup',
+    focused: false,
+    state: 'minimized',
+    width: 420,
+    height: 620,
+  });
+  if (!runnerWindow || !runnerWindow.id) {
+    throw new Error('后台导出窗口创建失败，请重试');
+  }
+  saveSelectionRunnerWindowId(runnerWindow.id);
+  return runnerWindow;
 }
 
 async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAfterSuccess = false } = {}) {
@@ -908,6 +969,7 @@ async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAft
     triggerDownload(md, mdFileName, 'text/markdown;charset=utf-8');
     setStatus('✅ 已导出 HTML + Obsidian 模板', 'success');
     if (closeAfterSuccess) {
+      clearSelectionRunnerWindowId();
       setTimeout(() => {
         try {
           window.close();
@@ -938,8 +1000,9 @@ if (exportBtn) {
 
 if (selectMsgBtn) {
   selectMsgBtn.addEventListener('click', async () => {
+    let tab = null;
     try {
-      const tab = await getActiveClaudeTab();
+      tab = await getActiveClaudeTab();
       const includeThinking = Boolean(document.getElementById('includeThinking')?.checked);
       const enableRename = Boolean(document.getElementById('enableRename')?.checked);
       const widgetImageExport = normalizeWidgetImagePreset(widgetImagePresetSelect?.value || DEFAULT_WIDGET_IMAGE_PRESET);
@@ -955,7 +1018,6 @@ if (selectMsgBtn) {
           includeThinking,
           enableRename,
           widgetImageExport,
-          runnerUrl: chrome.runtime.getURL('popup.html'),
           tabId: tab.id,
           sourceUrl: tab.url,
         }],
@@ -967,9 +1029,22 @@ if (selectMsgBtn) {
         throw new Error(payload && payload.error ? payload.error : '注入选择模式失败');
       }
 
+      await startSelectionRunnerWindow(tab, { includeThinking, enableRename, widgetImageExport });
       setSelectModeHint(true);
-      setStatus(payload.alreadyActive ? '页面已处于选择模式' : `✅ 已进入选择模式，可选 ${payload.count} 条用户消息`, 'success');
+      setStatus(payload.alreadyActive ? '页面已处于选择模式，后台导出已待命' : `✅ 已进入选择模式，可选 ${payload.count} 条用户消息`, 'success');
     } catch (error) {
+      try {
+        await closeStoredSelectionRunnerWindow();
+        if (tab) {
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: removeSelectUI,
+            world: 'MAIN',
+          });
+        }
+      } catch (cleanupError) {
+      }
+      setSelectModeHint(false);
       setStatus(error.message || String(error), 'error');
       selectMsgBtn.disabled = false;
     }
@@ -980,6 +1055,7 @@ if (cancelSelectPageBtn) {
   cancelSelectPageBtn.addEventListener('click', async () => {
     try {
       const tab = await getActiveClaudeTab();
+      await closeStoredSelectionRunnerWindow();
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: removeSelectUI,
@@ -994,33 +1070,22 @@ if (cancelSelectPageBtn) {
   });
 }
 
-function parseAutoExportRequest() {
+function parseSelectionRunnerRequest() {
   const params = new URLSearchParams(window.location.search);
-  if (params.get('autoExport') !== '1') return null;
+  if (params.get('selectionRunner') !== '1') return null;
   const tabId = Number(params.get('tabId'));
   if (!Number.isFinite(tabId) || tabId <= 0) return null;
-  let selectedUuids = [];
-  try {
-    const raw = params.get('selectedUuids');
-    const parsed = raw ? JSON.parse(raw) : [];
-    if (Array.isArray(parsed)) {
-      selectedUuids = parsed.map((value) => String(value)).filter(Boolean);
-    }
-  } catch (error) {
-    selectedUuids = [];
-  }
   return {
     tabId,
     sourceUrl: params.get('sourceUrl') || 'https://claude.ai',
     includeThinking: params.get('includeThinking') === '1',
     enableRename: params.get('enableRename') === '1',
     widgetPreset: params.get('widgetPreset') || DEFAULT_WIDGET_IMAGE_PRESET,
-    selectedUuids,
   };
 }
 
-async function maybeRunAutoExportFromQuery() {
-  const request = parseAutoExportRequest();
+async function maybeRunSelectionRunnerFromQuery() {
+  const request = parseSelectionRunnerRequest();
   if (!request) return false;
 
   if (document.getElementById('includeThinking')) {
@@ -1036,20 +1101,60 @@ async function maybeRunAutoExportFromQuery() {
   exportBtn.disabled = true;
   if (selectMsgBtn) selectMsgBtn.disabled = true;
   setSelectModeHint(false);
-  setStatus('正在接管选中消息导出…');
+  setStatus('后台导出已待命，等待页面点击“导出选中”…');
 
-  await runExport(
-    { id: request.tabId, url: request.sourceUrl },
-    {
-      selectedUuids: request.selectedUuids,
-      sourceUrl: request.sourceUrl,
-      closeAfterSuccess: true,
+  let idlePolls = 0;
+  while (true) {
+    let state = null;
+    try {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: request.tabId },
+        func: readSelectExportState,
+        world: 'MAIN',
+      });
+      state = result && result.result;
+    } catch (error) {
+      clearSelectionRunnerWindowId();
+      setStatus('导出失败：无法连接到 Claude 页面', 'error');
+      return true;
     }
-  );
+
+    if (state && state.pending && Array.isArray(state.pending.selectedUuids) && state.pending.selectedUuids.length > 0) {
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: request.tabId },
+          func: removeSelectUI,
+          world: 'MAIN',
+        });
+      } catch (error) {
+      }
+      await runExport(
+        { id: request.tabId, url: request.sourceUrl },
+        {
+          selectedUuids: state.pending.selectedUuids,
+          sourceUrl: request.sourceUrl,
+          closeAfterSuccess: true,
+        }
+      );
+      return true;
+    }
+
+    if (!state || !state.active) {
+      idlePolls += 1;
+      if (idlePolls >= 2) {
+        clearSelectionRunnerWindowId();
+        window.close();
+        return true;
+      }
+    } else {
+      idlePolls = 0;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 350));
+  }
   return true;
 }
 
-void maybeRunAutoExportFromQuery();
+void maybeRunSelectionRunnerFromQuery();
 
 // =====================================================================
 // 以下函数在页面上下文（claude.ai）中执行
