@@ -1492,6 +1492,35 @@ function extractAndBuild(runId, options) {
     return result;
   }
 
+  let markdownCodeBlockCounter = 0;
+
+  function formatCodeLanguageLabel(lang) {
+    const normalized = String(lang || '').trim().toLowerCase();
+    const labelMap = {
+      js: 'JavaScript',
+      jsx: 'JSX',
+      ts: 'TypeScript',
+      tsx: 'TSX',
+      py: 'Python',
+      rb: 'Ruby',
+      rs: 'Rust',
+      cpp: 'C++',
+      csharp: 'C#',
+      cs: 'C#',
+      sh: 'Shell',
+      bash: 'Bash',
+      zsh: 'Zsh',
+      yml: 'YAML',
+      md: 'Markdown',
+      html: 'HTML',
+      css: 'CSS',
+      json: 'JSON',
+      sql: 'SQL',
+    };
+    if (!normalized) return 'TEXT';
+    return labelMap[normalized] || normalized.toUpperCase();
+  }
+
   // ── 工具：轻量 Markdown → HTML（无外部依赖）────────────────────
   function md2html(text) {
     if (!text || !text.trim()) return '';
@@ -1501,8 +1530,27 @@ function extractAndBuild(runId, options) {
     const codeBlocks = [];
     html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
       const ph = `%%CB${codeBlocks.length}%%`;
+      const normalizedCode = String(code || '').replace(/^\n+|\n+$/g, '');
+      const languageLabel = formatCodeLanguageLabel(lang);
+      const copySourceId = `md-code-copy-${markdownCodeBlockCounter++}`;
       codeBlocks.push(
-        `<pre><code class="language-${lang || 'text'}">${escHtml(code.trim())}</code></pre>`
+        `<div class="code-block">
+          <div class="code-block-header">
+            <span class="code-block-lang">${escHtml(languageLabel)}</span>
+            <button
+              type="button"
+              class="code-block-copy turn-icon-btn"
+              data-copy-source-id="${copySourceId}"
+              data-default-html="${escHtml(copyIconSvg() + '<span class=\"sr-only\">复制代码</span>')}"
+              data-success-html="${escHtml(checkIconSvg() + '<span class=\"sr-only\">已复制</span>')}"
+              data-failure-html="${escHtml('<span class=\"turn-copy-failure\">!</span>')}"
+              aria-label="复制代码"
+              title="复制代码"
+            >${copyIconSvg()}<span class="sr-only">复制代码</span></button>
+          </div>
+          <textarea id="${copySourceId}" class="copy-source" aria-hidden="true" tabindex="-1">${escHtml(normalizedCode)}</textarea>
+          <pre><code class="language-${lang || 'text'}">${escHtml(normalizedCode)}</code></pre>
+        </div>`
       );
       return ph;
     });
@@ -1639,10 +1687,21 @@ function extractAndBuild(runId, options) {
       return `<p>${block.replace(/\n/g, '<br>')}</p>`;
     }).filter(Boolean).join('\n');
 
+    html = html.replace(/<p>(%%CB\d+%%)<\/p>/g, '$1');
     inlineTokens.forEach((fragment, i) => { html = html.replaceAll(`%%IN${i}%%`, fragment); });
+    // 修正“标题句 + 列表”被包进同一个 p 的非法结构
+    html = html.replace(/<p>([\s\S]*?)<br>\s*(<(?:ul|ol)>[\s\S]*?<\/(?:ul|ol)>)<\/p>/g, (_, intro, list) => {
+      const paragraph = intro.trim() ? `<p>${intro.trim()}</p>` : '';
+      return `${paragraph}\n${list}`;
+    });
+    html = html.replace(/<p>\s*(<(?:ul|ol)>[\s\S]*?<\/(?:ul|ol)>)\s*<\/p>/g, '$1');
     // 恢复代码块
     codeBlocks.forEach((cb, i) => { html = html.replace(`%%CB${i}%%`, cb); });
-    html = html.replace(/<p>(%%CB\d+%%)<\/p>/g, '$1');
+    html = html.replace(/<p>\s*(<div class="code-block">[\s\S]*?<\/div>)\s*<\/p>/g, '$1');
+    // 清理列表内部被错误注入的 <br>
+    html = html.replace(/<(ul|ol)>\s*<br\s*\/?>/g, '<$1>');
+    html = html.replace(/<br\s*\/?>\s*<\/(ul|ol)>/g, '</$1>');
+    html = html.replace(/<\/li>\s*<br\s*\/?>\s*<li>/g, '</li><li>');
     return html;
   }
 
@@ -1761,12 +1820,12 @@ function extractAndBuild(runId, options) {
     return `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m5 12.5 4.2 4.2L19 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>`;
   }
 
-  function summarizePromptLabel(text, index) {
+  function summarizePromptPreview(text) {
     const compact = String(text || '')
       .replace(/\s+/g, ' ')
       .trim();
-    if (!compact) return `问题 ${index}`;
-    return compact.length > 28 ? `${compact.slice(0, 28)}…` : compact;
+    if (!compact) return '（该条用户消息主要是附件或空文本）';
+    return compact.length > 52 ? `${compact.slice(0, 52)}…` : compact;
   }
 
   function joinMarkdownParts(parts) {
@@ -2420,14 +2479,17 @@ marker path { stroke: #7F77DD; fill: none; }
 
         if (!textContent.trim() && attList.length === 0) continue;
 
-        const promptLabel = summarizePromptLabel(rawTextContent, promptTocItems.length + 1);
-        const promptSectionId = makeAnchorId('prompt', promptLabel, promptTocItems.length + 1);
+        const promptIndex = promptTocItems.length + 1;
+        const promptLabel = `问题 ${promptIndex}`;
+        const promptPreview = summarizePromptPreview(rawTextContent);
+        const promptSectionId = makeAnchorId('prompt', promptPreview, promptIndex);
         promptTocItems.push({
           id: promptSectionId,
           title: promptLabel,
+          preview: promptPreview,
         });
         promptSummaries.push({
-          label: promptLabel,
+          label: promptPreview,
           text: rawTextContent.trim() || '（该条用户消息主要是附件或空文本，没有可提取的 prompt 文本。）',
         });
 
@@ -2437,14 +2499,38 @@ marker path { stroke: #7F77DD; fill: none; }
             ).join('')}</div>`
           : '';
         const dialogHtml = attList.map(a => renderAttachmentDialog(a, a.dialogId)).join('');
+        const promptCopyId = `prompt-copy-${messageKey}`;
+        const promptActionHtml = rawTextContent.trim()
+          ? `
+<div class="turn-actions turn-actions--user">
+  <textarea id="${promptCopyId}" class="copy-source" aria-hidden="true" tabindex="-1">${escHtml(rawTextContent)}</textarea>
+  <button
+    type="button"
+    class="turn-icon-btn turn-copy-btn"
+    data-copy-source-id="${promptCopyId}"
+    data-default-html="${escHtml(copyIconSvg())}"
+    data-success-html="${escHtml(checkIconSvg())}"
+    data-failure-html="${escHtml('<span class=\"turn-copy-failure\">!</span>')}"
+    aria-label="复制问题文本"
+    title="复制问题文本"
+  >${copyIconSvg()}</button>
+</div>`
+          : '';
+        const userMetaHtml = (timeLabel || promptActionHtml)
+          ? `
+<div class="turn-meta turn-meta--user">
+  ${timeLabel ? `<div class="turn-time">${escHtml(timeLabel)}</div>` : ''}
+  ${promptActionHtml}
+</div>`
+          : '';
         turnsHtml.push(`
 <section id="${promptSectionId}" class="prompt-section">
   <div class="turn user-turn">
-    <div class="avatar ua">你</div>
+    <div class="avatar ua" aria-hidden="true"></div>
     <div class="bubble ub">
       ${attachHtml}
       <div class="md user-text">${md2html(textContent)}</div>
-      ${timeLabel ? `<div class="turn-time">${escHtml(timeLabel)}</div>` : ''}
+      ${userMetaHtml}
       ${dialogHtml}
     </div>
   </div>
@@ -2609,7 +2695,11 @@ body {
   display: flex; align-items: center; justify-content: center;
   font-weight: 700; font-size: 13px; margin-top: 2px;
 }
-.ua { background: #7c3aed; color: #fff; }
+.ua {
+  background: linear-gradient(180deg, #7a7266 0%, #61584f 100%);
+  color: transparent;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.18);
+}
 .ca { background: #cc8a22; color: #fff; }
 
 /* ── 气泡 ── */
@@ -2620,7 +2710,7 @@ body {
 
 /* 用户气泡：轻灰色，不抢眼 */
 .ub {
-  background: #efefef;
+  background: #f0eee6;
   color: #1a1a1a;
   border-bottom-right-radius: 6px;
   font-size: 15px;
@@ -2725,7 +2815,14 @@ body {
   justify-content: flex-end;
   margin-top: 8px;
 }
+.turn-meta--user {
+  justify-content: flex-end;
+  margin-top: 10px;
+}
 .turn-meta--assistant .turn-time {
+  margin-top: 0;
+}
+.turn-meta--user .turn-time {
   margin-top: 0;
 }
 .turn-actions {
@@ -2734,6 +2831,9 @@ body {
   gap: 8px;
 }
 .turn-actions--assistant {
+  margin-top: 0;
+}
+.turn-actions--user {
   margin-top: 0;
 }
 .turn-icon-btn {
@@ -2765,6 +2865,17 @@ body {
   font-size: 15px;
   font-weight: 700;
   line-height: 1;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 .user-turn .turn-time {
   text-align: right;
@@ -2799,10 +2910,53 @@ body {
 }
 
 /* 代码块 */
-.md pre {
-  background: #1c1c1e; color: #e5e5ea;
-  padding: 16px 18px; border-radius: 10px;
-  overflow-x: auto; font-size: 13px; line-height: 1.6; margin: 14px 0;
+.md .code-block {
+  margin: 14px 0;
+  border-radius: 14px;
+  overflow: hidden;
+  background: #fffdfa;
+  border: 1px solid #ebe4d8;
+  box-shadow: 0 10px 22px rgba(68, 58, 43, .06);
+}
+.code-block-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #eee8de;
+  background: linear-gradient(180deg, #ffffff 0%, #fbf9f4 100%);
+}
+.code-block-lang {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: #f6f2eb;
+  color: #7b6f61;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.code-block-copy {
+  width: auto;
+  min-width: 32px;
+  padding: 0 9px;
+  gap: 0;
+  border-radius: 9px;
+  color: #8b7f71;
+}
+.code-block-copy:hover {
+  background: rgba(68,58,43,.07);
+  color: #4b433a;
+}
+.md .code-block pre {
+  background: #fffdfa;
+  color: #3f3b35;
+  padding: 16px 18px; border-radius: 0;
+  overflow-x: auto; font-size: 13px; line-height: 1.6; margin: 0;
 }
 .md code { font-family: 'JetBrains Mono','Fira Code',Consolas,monospace; }
 .md p code, .md li code {
@@ -3042,9 +3196,28 @@ body {
 
   .toc-text {
     min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+
+  .toc-label {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .04em;
+    color: #8a7b69;
+    text-transform: uppercase;
+  }
+
+  .toc-preview {
     font-size: 12px;
     line-height: 1.45;
     word-break: break-word;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+    overflow: hidden;
   }
 }
 
@@ -3096,8 +3269,11 @@ body {
   .toc-link.is-active { background: #2a2416; color: #f4d38a; }
   .toc-index { background: #38342f; color: #d6d3d1; }
   .toc-link.is-active .toc-index { background: #5a4a20; color: #f4d38a; }
+  .toc-label { color: #bfae97; }
   .turn-icon-btn { color: #b5b0a8; }
   .turn-icon-btn:hover { background: #2c2a26; color: #f0ece4; }
+  .code-block-copy { color: #d6cfbf; }
+  .code-block-copy:hover { background: rgba(255,255,255,.1); color: #fff4db; }
 }
 `;
 
@@ -3448,7 +3624,10 @@ postPageHeight();
       ${promptTocItems.map((item, index) => `
       <a class="toc-link prompt-toc-link${index === 0 ? ' is-active' : ''}" href="#${escHtml(item.id)}" data-target-id="${escHtml(item.id)}">
         <span class="toc-index">${index + 1}</span>
-        <span class="toc-text">${escHtml(item.title)}</span>
+        <span class="toc-text">
+          <span class="toc-label">${escHtml(item.title)}</span>
+          <span class="toc-preview">${escHtml(item.preview || item.title)}</span>
+        </span>
       </a>`).join('')}
     </nav>
   </aside>`
