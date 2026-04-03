@@ -197,6 +197,7 @@ async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAft
   const includeThinking = Boolean(document.getElementById('includeThinking')?.checked);
   const enableRename = Boolean(document.getElementById('enableRename')?.checked);
   const debugMode = loadDebugModeEnabled();
+  const directoryPref = await ensureConfiguredExportDirectoryReady();
   const widgetImageExport = normalizeWidgetImagePreset(widgetImagePresetSelect?.value || DEFAULT_WIDGET_IMAGE_PRESET);
   const pretextBundle = await loadPretextBundleText();
   const exportResources = await loadExportResources();
@@ -206,6 +207,8 @@ async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAft
     selectedCount: Array.isArray(selectedUuids) ? selectedUuids.length : 0,
     closeAfterSuccess,
     exportDirectoryEnabled: loadUseExportDirectoryEnabled(),
+    exportDirectoryReady: directoryPref.ready,
+    exportDirectoryError: directoryPref.error || '',
     debugMode,
   });
 
@@ -300,9 +303,12 @@ async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAft
       htmlMethod: htmlDownload && htmlDownload.method,
       mdMethod: mdDownload && mdDownload.method,
     });
+    const wantsDirectoryExport = loadUseExportDirectoryEnabled();
     const sameDirectory = htmlDownload && mdDownload && htmlDownload.method === 'directory' && mdDownload.method === 'directory';
     if (sameDirectory) {
       setStatus(`✅ 已导出到固定目录：${htmlDownload.directoryName}`, 'success');
+    } else if (wantsDirectoryExport) {
+      setStatus('⚠️ 固定目录写入未生效，已回退到浏览器下载。可开启调试模式查看原因。', 'error');
     } else {
       setStatus('✅ 已导出 HTML + Obsidian 模板', 'success');
     }

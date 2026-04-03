@@ -43,6 +43,12 @@ async function triggerDownload(content, fileName, mime) {
         directoryName: directoryResult.directoryName,
       };
     }
+    if (directoryResult && directoryResult.error) {
+      await appendDebugLog('popup', 'export-directory-write-failed', {
+        fileName,
+        error: directoryResult.error,
+      });
+    }
   }
 
   const blob = new Blob([content], { type: mime });
@@ -292,21 +298,56 @@ async function ensureExportDirectoryPermission(handle) {
   if (!handle) return false;
   if (typeof handle.queryPermission !== 'function') return true;
   const status = await handle.queryPermission({ mode: 'readwrite' });
-  return status === 'granted';
+  if (status === 'granted') return true;
+  if (typeof handle.requestPermission === 'function') {
+    const next = await handle.requestPermission({ mode: 'readwrite' });
+    return next === 'granted';
+  }
+  return false;
 }
 
 async function tryWriteToExportDirectory(content, fileName, mime) {
+  try {
+    const handle = await getStoredExportDirectoryHandle();
+    if (!handle) {
+      return { ok: false, error: 'missing-directory-handle' };
+    }
+    const permitted = await ensureExportDirectoryPermission(handle);
+    if (!permitted) {
+      return { ok: false, error: 'directory-permission-denied' };
+    }
+    const fileHandle = await handle.getFileHandle(fileName, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(new Blob([content], { type: mime }));
+    await writable.close();
+    return {
+      ok: true,
+      fileName,
+      directoryName: handle.name || '已选目录',
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error && error.message ? error.message : String(error),
+    };
+  }
+}
+
+async function ensureConfiguredExportDirectoryReady() {
+  if (!loadUseExportDirectoryEnabled()) {
+    return { enabled: false, ready: false };
+  }
   const handle = await getStoredExportDirectoryHandle();
-  if (!handle) return null;
+  if (!handle) {
+    return { enabled: true, ready: false, error: 'missing-directory-handle' };
+  }
   const permitted = await ensureExportDirectoryPermission(handle);
-  if (!permitted) return null;
-  const fileHandle = await handle.getFileHandle(fileName, { create: true });
-  const writable = await fileHandle.createWritable();
-  await writable.write(new Blob([content], { type: mime }));
-  await writable.close();
+  if (!permitted) {
+    return { enabled: true, ready: false, error: 'directory-permission-denied' };
+  }
   return {
-    ok: true,
-    fileName,
+    enabled: true,
+    ready: true,
     directoryName: handle.name || '已选目录',
   };
 }
