@@ -178,13 +178,44 @@ async function startSelectionRunnerTab(tab, { includeThinking, enableRename, wid
   params.set('enableRename', enableRename ? '1' : '0');
   params.set('widgetPreset', String((widgetImageExport && widgetImageExport.id) || DEFAULT_WIDGET_IMAGE_PRESET));
   const runnerUrl = `${chrome.runtime.getURL('popup.html')}?${params.toString()}`;
-  const runnerTab = await chrome.tabs.create({
+  const baseCreateOptions = {
     url: runnerUrl,
     active: false,
     windowId: tab.windowId,
     index: typeof tab.index === 'number' ? tab.index + 1 : undefined,
-    openerTabId: tab.id,
+  };
+  await appendDebugLog('popup', 'runner-tab-create-attempt', {
+    sourceTabId: tab.id,
+    sourceWindowId: tab.windowId,
+    sourceIndex: tab.index,
+    sourceIncognito: Boolean(tab.incognito),
+    usesOpenerTabId: !tab.incognito,
   });
+  let runnerTab;
+  try {
+    runnerTab = await chrome.tabs.create({
+      ...baseCreateOptions,
+      ...(tab.incognito ? {} : { openerTabId: tab.id }),
+    });
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    await appendDebugLog('popup', 'runner-tab-create-primary-failed', {
+      sourceTabId: tab.id,
+      sourceWindowId: tab.windowId,
+      sourceIncognito: Boolean(tab.incognito),
+      error: message,
+    });
+    if (!/opener/i.test(message)) {
+      throw error;
+    }
+    runnerTab = await chrome.tabs.create({
+      ...baseCreateOptions,
+    });
+    await appendDebugLog('popup', 'runner-tab-create-fallback-no-opener', {
+      runnerTabId: runnerTab && runnerTab.id,
+      sourceTabId: tab.id,
+    });
+  }
   if (!runnerTab || !runnerTab.id) {
     throw new Error('后台导出标签页创建失败，请重试');
   }
