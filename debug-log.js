@@ -39,7 +39,7 @@ async function renderLogs() {
   if (entries.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'empty';
-    empty.textContent = '还没有日志。先去跑一次导出或选择消息导出，再回来刷新。';
+    empty.textContent = '还没有日志。先在弹窗里开启调试模式，再去跑一次导出或选择消息导出，然后回来刷新。';
     logList.appendChild(empty);
     return;
   }

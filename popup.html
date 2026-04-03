@@ -119,8 +119,49 @@
       box-shadow: none;
       transform: none;
     }
-    .options {
+    .primary-actions {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .advanced-panel {
       margin: 0 0 14px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: linear-gradient(180deg, rgba(255, 252, 247, 0.96) 0%, rgba(248, 242, 232, 0.96) 100%);
+      overflow: hidden;
+    }
+    .advanced-panel summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 12px 14px;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--accent-strong);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      user-select: none;
+    }
+    .advanced-panel summary::-webkit-details-marker {
+      display: none;
+    }
+    .advanced-panel summary::after {
+      content: "展开选项";
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--muted);
+    }
+    .advanced-panel[open] summary::after {
+      content: "收起选项";
+    }
+    .advanced-panel-body {
+      padding: 0 12px 12px;
+      border-top: 1px solid rgba(231, 221, 207, 0.72);
+    }
+    .options {
+      margin: 12px 0 0;
       padding: 12px;
       border-radius: 14px;
       background: linear-gradient(180deg, rgba(255, 252, 247, 0.96) 0%, rgba(248, 242, 232, 0.96) 100%);
@@ -169,6 +210,48 @@
       font-size: 11px;
       color: var(--muted);
     }
+    .option-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .option-actions button {
+      flex: 1;
+      margin-top: 0;
+      padding: 9px 10px;
+      font-size: 12px;
+      border-radius: 10px;
+      box-shadow: none;
+    }
+    .option-actions .btn-ghost {
+      background: rgba(255, 251, 245, 0.88);
+    }
+    .option-actions .btn-secondary {
+      background: linear-gradient(180deg, #efe2cf 0%, #e4d2bb 100%);
+    }
+    .path-chip {
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(255, 253, 249, 0.95);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.45;
+      word-break: break-word;
+    }
+    .path-chip strong {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--accent-strong);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .path-chip.is-empty {
+      color: var(--muted);
+      font-style: italic;
+    }
     #status {
       margin-top: 11px;
       min-height: 18px;
@@ -213,7 +296,14 @@
     <p class="eyebrow">Claude Export</p>
     <h2>离线导出面板</h2>
     <p class="subhead">导出成和阅读页同风格的 HTML，保留控件、附件和论文友好的图片清晰度。</p>
-    <div class="options">
+    <div class="primary-actions">
+      <button id="exportBtn">导出为完全离线 HTML</button>
+      <button id="selectMsgBtn" class="btn-secondary">选择消息导出…</button>
+    </div>
+    <details class="advanced-panel">
+      <summary>更多导出选项</summary>
+      <div class="advanced-panel-body">
+        <div class="options">
       <label class="option-row" for="includeThinking">
         <input id="includeThinking" type="checkbox"/>
         <span>包含思维链
@@ -227,18 +317,35 @@
         </span>
       </label>
       <div class="option-row option-row--stack" style="margin-top: 12px;">
-        <label for="widgetImagePreset">控件图片导出清晰度</label>
-        <select id="widgetImagePreset">
-          <option value="2x">2x 屏幕高清</option>
-          <option value="300dpi" selected>300 DPI（默认）</option>
-          <option value="600dpi">600 DPI（论文打印）</option>
-        </select>
-        <span class="option-meta">默认按 300 DPI 导出控件图片；600 DPI 适合直接放进论文。</span>
-      </div>
+      <label for="widgetImagePreset">控件图片导出清晰度</label>
+      <select id="widgetImagePreset">
+        <option value="2x">2x 屏幕高清</option>
+        <option value="300dpi" selected>300 DPI（默认）</option>
+        <option value="600dpi">600 DPI（论文打印）</option>
+      </select>
+      <span class="option-meta">默认按 300 DPI 导出控件图片；600 DPI 适合直接放进论文。</span>
     </div>
-    <button id="exportBtn">导出为完全离线 HTML</button>
-    <button id="selectMsgBtn" class="btn-secondary">选择消息导出…</button>
-    <button id="openDebugLogBtn" class="btn-ghost" type="button">查看调试日志</button>
+      <label class="option-row" for="useExportDirectory" style="margin-top: 12px;">
+        <input id="useExportDirectory" type="checkbox"/>
+        <span>直接导出到固定目录
+          <span class="option-meta">开启后优先写入你选定的 Obsidian / 存档目录，不再每次先下载再手动移动。</span>
+        </span>
+      </label>
+      <div id="exportDirectoryMeta" class="path-chip is-empty">还没有选择固定导出目录。</div>
+      <div class="option-actions">
+        <button id="chooseExportDirectoryBtn" type="button" class="btn-secondary">选择目录</button>
+        <button id="clearExportDirectoryBtn" type="button" class="btn-ghost">清除目录</button>
+      </div>
+      <label class="option-row" for="enableDebugMode" style="margin-top: 12px;">
+        <input id="enableDebugMode" type="checkbox"/>
+        <span>开启调试模式
+          <span class="option-meta">默认关闭。打开后才记录扩展日志、显示导出页运行时日志入口，普通使用时尽量无感。</span>
+        </span>
+      </label>
+        </div>
+        <button id="openDebugLogBtn" class="btn-ghost" type="button">查看调试日志</button>
+      </div>
+    </details>
     <div class="select-mode-hint" id="selectModeHint">
       📌 页面已进入选择模式<br>在对话页面勾选消息后，点击底部「导出选中」按钮
     </div>

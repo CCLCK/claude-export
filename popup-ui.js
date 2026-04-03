@@ -14,6 +14,116 @@ const openDebugLogBtn = document.getElementById('openDebugLogBtn');
 const statusEl = document.getElementById('status');
 const selectModeHint = document.getElementById('selectModeHint');
 const cancelSelectPageBtn = document.getElementById('cancelSelectPageBtn');
+const enableDebugModeCheckbox = document.getElementById('enableDebugMode');
+const useExportDirectoryCheckbox = document.getElementById('useExportDirectory');
+const exportDirectoryMeta = document.getElementById('exportDirectoryMeta');
+const chooseExportDirectoryBtn = document.getElementById('chooseExportDirectoryBtn');
+const clearExportDirectoryBtn = document.getElementById('clearExportDirectoryBtn');
+
+function refreshDebugModeUi() {
+  const enabled = loadDebugModeEnabled();
+  if (enableDebugModeCheckbox) enableDebugModeCheckbox.checked = enabled;
+  if (openDebugLogBtn) openDebugLogBtn.style.display = enabled ? '' : 'none';
+}
+
+async function refreshExportDirectoryUi() {
+  const enabled = loadUseExportDirectoryEnabled();
+  const label = loadExportDirectoryLabel();
+  const handle = await getStoredExportDirectoryHandle();
+  const hasHandle = Boolean(handle);
+  if (useExportDirectoryCheckbox) {
+    useExportDirectoryCheckbox.checked = enabled && hasHandle;
+    useExportDirectoryCheckbox.disabled = typeof window.showDirectoryPicker !== 'function';
+  }
+  if (exportDirectoryMeta) {
+    if (hasHandle && label) {
+      exportDirectoryMeta.classList.remove('is-empty');
+      exportDirectoryMeta.innerHTML = `<strong>当前目录</strong>${label}`;
+    } else if (typeof window.showDirectoryPicker !== 'function') {
+      exportDirectoryMeta.classList.add('is-empty');
+      exportDirectoryMeta.textContent = '当前环境不支持目录授权，只能走浏览器下载。';
+    } else {
+      exportDirectoryMeta.classList.add('is-empty');
+      exportDirectoryMeta.textContent = '还没有选择固定导出目录。';
+    }
+  }
+  if (clearExportDirectoryBtn) clearExportDirectoryBtn.disabled = !hasHandle;
+}
+
+refreshDebugModeUi();
+void refreshExportDirectoryUi();
+
+if (enableDebugModeCheckbox) {
+  enableDebugModeCheckbox.addEventListener('change', () => {
+    saveDebugModeEnabled(enableDebugModeCheckbox.checked);
+    refreshDebugModeUi();
+  });
+}
+
+if (chooseExportDirectoryBtn) {
+  chooseExportDirectoryBtn.addEventListener('click', async () => {
+    chooseExportDirectoryBtn.disabled = true;
+    clearExportDirectoryBtn.disabled = true;
+    try {
+      const result = await pickAndStoreExportDirectory();
+      await appendDebugLog('popup', 'export-directory-picked', { name: result.name });
+      await refreshExportDirectoryUi();
+      setStatus(`✅ 已固定导出目录：${result.name}`, 'success');
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      await appendDebugLog('popup', 'export-directory-pick-failed', { error: message });
+      setStatus(`目录设置失败：${message}`, 'error');
+    } finally {
+      chooseExportDirectoryBtn.disabled = false;
+      await refreshExportDirectoryUi();
+    }
+  });
+}
+
+if (clearExportDirectoryBtn) {
+  clearExportDirectoryBtn.addEventListener('click', async () => {
+    clearExportDirectoryBtn.disabled = true;
+    try {
+      await clearStoredExportDirectoryHandle();
+      await appendDebugLog('popup', 'export-directory-cleared');
+      await refreshExportDirectoryUi();
+      setStatus('已清除固定导出目录，后续回退到浏览器下载。', 'success');
+    } finally {
+      await refreshExportDirectoryUi();
+    }
+  });
+}
+
+if (useExportDirectoryCheckbox) {
+  useExportDirectoryCheckbox.addEventListener('change', async () => {
+    if (!useExportDirectoryCheckbox.checked) {
+      saveUseExportDirectoryEnabled(false);
+      await appendDebugLog('popup', 'export-directory-disabled');
+      await refreshExportDirectoryUi();
+      setStatus('已关闭固定目录导出。', 'success');
+      return;
+    }
+    const handle = await getStoredExportDirectoryHandle();
+    if (!handle) {
+      try {
+        const result = await pickAndStoreExportDirectory();
+        await appendDebugLog('popup', 'export-directory-enabled-via-checkbox', { name: result.name });
+        setStatus(`✅ 已固定导出目录：${result.name}`, 'success');
+      } catch (error) {
+        useExportDirectoryCheckbox.checked = false;
+        saveUseExportDirectoryEnabled(false);
+        setStatus(`目录设置失败：${error.message || error}`, 'error');
+      } finally {
+        await refreshExportDirectoryUi();
+      }
+      return;
+    }
+    saveUseExportDirectoryEnabled(true);
+    await appendDebugLog('popup', 'export-directory-enabled');
+    await refreshExportDirectoryUi();
+    setStatus('已开启固定目录导出。', 'success');
+  });
+}
 
 function setStatus(message, type = '') {
   if (!statusEl) return;
@@ -86,13 +196,17 @@ async function startSelectionRunnerTab(tab, { includeThinking, enableRename, wid
 async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAfterSuccess = false } = {}) {
   const includeThinking = Boolean(document.getElementById('includeThinking')?.checked);
   const enableRename = Boolean(document.getElementById('enableRename')?.checked);
+  const debugMode = loadDebugModeEnabled();
   const widgetImageExport = normalizeWidgetImagePreset(widgetImagePresetSelect?.value || DEFAULT_WIDGET_IMAGE_PRESET);
   const pretextBundle = await loadPretextBundleText();
+  const exportResources = await loadExportResources();
   saveWidgetImagePresetId(widgetImageExport.id);
   await appendDebugLog('popup', 'run-export-start', {
     tabId: tab && tab.id,
     selectedCount: Array.isArray(selectedUuids) ? selectedUuids.length : 0,
     closeAfterSuccess,
+    exportDirectoryEnabled: loadUseExportDirectoryEnabled(),
+    debugMode,
   });
 
   exportBtn.disabled = true;
@@ -134,7 +248,17 @@ async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAft
     const exportPromise = chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: extractAndBuild,
-      args: [runId, { includeThinking, widgetImageExport, selectedUuids, pretextBundle }],
+      args: [runId, {
+        includeThinking,
+        widgetImageExport,
+        selectedUuids,
+        pretextBundle,
+        debugMode,
+        pageCss: exportResources.pageCss,
+        pageScript: exportResources.pageScript,
+        widgetThemeCss: exportResources.widgetThemeCss,
+        widgetShell: exportResources.widgetShell,
+      }],
       world: 'MAIN',
     });
     pollTimer = setInterval(pollProgress, 350);
@@ -166,11 +290,22 @@ async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAft
       sourceUrl: sourceUrl || tab.url,
       promptSummaries: Array.isArray(payload.promptSummaries) ? payload.promptSummaries : [],
     });
-    await triggerDownload(html, htmlFileName, 'text/html;charset=utf-8');
+    const htmlDownload = await triggerDownload(html, htmlFileName, 'text/html;charset=utf-8');
     await new Promise((resolve) => setTimeout(resolve, 150));
-    await triggerDownload(md, mdFileName, 'text/markdown;charset=utf-8');
-    await appendDebugLog('popup', 'run-export-success', { htmlFileName, mdFileName, title: title || 'Claude Chat' });
-    setStatus('✅ 已导出 HTML + Obsidian 模板', 'success');
+    const mdDownload = await triggerDownload(md, mdFileName, 'text/markdown;charset=utf-8');
+    await appendDebugLog('popup', 'run-export-success', {
+      htmlFileName,
+      mdFileName,
+      title: title || 'Claude Chat',
+      htmlMethod: htmlDownload && htmlDownload.method,
+      mdMethod: mdDownload && mdDownload.method,
+    });
+    const sameDirectory = htmlDownload && mdDownload && htmlDownload.method === 'directory' && mdDownload.method === 'directory';
+    if (sameDirectory) {
+      setStatus(`✅ 已导出到固定目录：${htmlDownload.directoryName}`, 'success');
+    } else {
+      setStatus('✅ 已导出 HTML + Obsidian 模板', 'success');
+    }
     if (closeAfterSuccess) {
       clearSelectionRunnerTabId();
       setTimeout(() => {

@@ -34,11 +34,22 @@ function yamlQuoted(value) {
 }
 
 async function triggerDownload(content, fileName, mime) {
+  if (loadUseExportDirectoryEnabled()) {
+    const directoryResult = await tryWriteToExportDirectory(content, fileName, mime);
+    if (directoryResult && directoryResult.ok) {
+      return {
+        method: 'directory',
+        fileName: directoryResult.fileName,
+        directoryName: directoryResult.directoryName,
+      };
+    }
+  }
+
   const blob = new Blob([content], { type: mime });
   const url = URL.createObjectURL(blob);
   try {
     if (chrome.downloads && typeof chrome.downloads.download === 'function') {
-      await new Promise((resolve, reject) => {
+      const downloadId = await new Promise((resolve, reject) => {
         chrome.downloads.download({
           url,
           filename: fileName,
@@ -56,7 +67,7 @@ async function triggerDownload(content, fileName, mime) {
           resolve(downloadId);
         });
       });
-      return;
+      return { method: 'downloads', fileName, downloadId };
     }
 
     const a = document.createElement('a');
@@ -65,6 +76,7 @@ async function triggerDownload(content, fileName, mime) {
     document.body.appendChild(a);
     a.click();
     a.remove();
+    return { method: 'downloads', fileName, downloadId: null };
   } finally {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
@@ -73,8 +85,17 @@ async function triggerDownload(content, fileName, mime) {
 const WIDGET_IMAGE_PRESET_KEY = 'claude-export-widget-image-preset';
 const SELECTION_RUNNER_TAB_KEY = 'claude-export-selection-runner-tab-id';
 const DEBUG_LOG_KEY = 'claude-export-debug-log';
+const DEBUG_MODE_KEY = 'claude-export-debug-mode-enabled';
+const EXPORT_DIR_ENABLED_KEY = 'claude-export-export-dir-enabled';
+const EXPORT_DIR_LABEL_KEY = 'claude-export-export-dir-label';
+const EXPORT_DIR_DB_NAME = 'claude-export-fs';
+const EXPORT_DIR_DB_VERSION = 1;
+const EXPORT_DIR_STORE = 'handles';
+const EXPORT_DIR_HANDLE_KEY = 'export-directory';
 const DEFAULT_WIDGET_IMAGE_PRESET = '300dpi';
 let pretextBundlePromise = null;
+let exportResourceCache = null;
+let exportDirectoryDbPromise = null;
 
 function normalizeWidgetImagePreset(preset) {
   const value = String(preset || '').toLowerCase();
@@ -129,6 +150,194 @@ function saveSelectionRunnerTabId(tabId) {
   }
 }
 
+function loadDebugModeEnabled() {
+  try {
+    return localStorage.getItem(DEBUG_MODE_KEY) === '1';
+  } catch (error) {
+    return false;
+  }
+}
+
+function saveDebugModeEnabled(enabled) {
+  try {
+    localStorage.setItem(DEBUG_MODE_KEY, enabled ? '1' : '0');
+  } catch (error) {
+    // Ignore popup-local persistence failures.
+  }
+}
+
+function loadUseExportDirectoryEnabled() {
+  try {
+    return localStorage.getItem(EXPORT_DIR_ENABLED_KEY) === '1';
+  } catch (error) {
+    return false;
+  }
+}
+
+function saveUseExportDirectoryEnabled(enabled) {
+  try {
+    localStorage.setItem(EXPORT_DIR_ENABLED_KEY, enabled ? '1' : '0');
+  } catch (error) {
+    // Ignore popup-local persistence failures.
+  }
+}
+
+function loadExportDirectoryLabel() {
+  try {
+    return localStorage.getItem(EXPORT_DIR_LABEL_KEY) || '';
+  } catch (error) {
+    return '';
+  }
+}
+
+function saveExportDirectoryLabel(label) {
+  try {
+    localStorage.setItem(EXPORT_DIR_LABEL_KEY, String(label || ''));
+  } catch (error) {
+    // Ignore popup-local persistence failures.
+  }
+}
+
+function openExportDirectoryDb() {
+  if (!exportDirectoryDbPromise) {
+    exportDirectoryDbPromise = new Promise((resolve, reject) => {
+      const request = indexedDB.open(EXPORT_DIR_DB_NAME, EXPORT_DIR_DB_VERSION);
+      request.onerror = () => reject(request.error || new Error('indexeddb-open-failed'));
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(EXPORT_DIR_STORE)) {
+          db.createObjectStore(EXPORT_DIR_STORE);
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+    });
+  }
+  return exportDirectoryDbPromise;
+}
+
+async function exportDirectoryDbGet(key) {
+  const db = await openExportDirectoryDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(EXPORT_DIR_STORE, 'readonly');
+    const store = tx.objectStore(EXPORT_DIR_STORE);
+    const request = store.get(key);
+    request.onerror = () => reject(request.error || new Error('indexeddb-get-failed'));
+    request.onsuccess = () => resolve(request.result || null);
+  });
+}
+
+async function exportDirectoryDbPut(key, value) {
+  const db = await openExportDirectoryDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(EXPORT_DIR_STORE, 'readwrite');
+    tx.onabort = () => reject(tx.error || new Error('indexeddb-put-failed'));
+    tx.onerror = () => reject(tx.error || new Error('indexeddb-put-failed'));
+    tx.oncomplete = () => resolve();
+    tx.objectStore(EXPORT_DIR_STORE).put(value, key);
+  });
+}
+
+async function exportDirectoryDbDelete(key) {
+  const db = await openExportDirectoryDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(EXPORT_DIR_STORE, 'readwrite');
+    tx.onabort = () => reject(tx.error || new Error('indexeddb-delete-failed'));
+    tx.onerror = () => reject(tx.error || new Error('indexeddb-delete-failed'));
+    tx.oncomplete = () => resolve();
+    tx.objectStore(EXPORT_DIR_STORE).delete(key);
+  });
+}
+
+async function getStoredExportDirectoryHandle() {
+  try {
+    return await exportDirectoryDbGet(EXPORT_DIR_HANDLE_KEY);
+  } catch (error) {
+    return null;
+  }
+}
+
+async function clearStoredExportDirectoryHandle() {
+  try {
+    await exportDirectoryDbDelete(EXPORT_DIR_HANDLE_KEY);
+  } catch (error) {
+    // Ignore cleanup failures.
+  }
+  saveExportDirectoryLabel('');
+  saveUseExportDirectoryEnabled(false);
+}
+
+async function pickAndStoreExportDirectory() {
+  if (typeof window.showDirectoryPicker !== 'function') {
+    throw new Error('当前浏览器环境不支持目录选择');
+  }
+  const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+  if (!handle) {
+    throw new Error('目录选择已取消');
+  }
+  if (typeof handle.requestPermission === 'function') {
+    const permission = await handle.requestPermission({ mode: 'readwrite' });
+    if (permission !== 'granted') {
+      throw new Error('目录写入授权未通过');
+    }
+  }
+  await exportDirectoryDbPut(EXPORT_DIR_HANDLE_KEY, handle);
+  saveExportDirectoryLabel(handle.name || '');
+  saveUseExportDirectoryEnabled(true);
+  return {
+    name: handle.name || '已选目录',
+  };
+}
+
+async function ensureExportDirectoryPermission(handle) {
+  if (!handle) return false;
+  if (typeof handle.queryPermission !== 'function') return true;
+  const status = await handle.queryPermission({ mode: 'readwrite' });
+  return status === 'granted';
+}
+
+async function tryWriteToExportDirectory(content, fileName, mime) {
+  const handle = await getStoredExportDirectoryHandle();
+  if (!handle) return null;
+  const permitted = await ensureExportDirectoryPermission(handle);
+  if (!permitted) return null;
+  const fileHandle = await handle.getFileHandle(fileName, { create: true });
+  const writable = await fileHandle.createWritable();
+  await writable.write(new Blob([content], { type: mime }));
+  await writable.close();
+  return {
+    ok: true,
+    fileName,
+    directoryName: handle.name || '已选目录',
+  };
+}
+
+async function loadTextResource(resourceName) {
+  const url = chrome.runtime.getURL(resourceName);
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`资源读取失败：${resourceName}`);
+  }
+  return String(await response.text() || '');
+}
+
+async function loadExportResources() {
+  if (!exportResourceCache) {
+    exportResourceCache = (async () => {
+      const pageCss = await loadTextResource('export-page.css');
+      const pageScript = (await loadTextResource('export-page.js')).replace(/<\/script/gi, '<\\/script');
+      const widgetThemeCss = await loadTextResource('widget-theme.css');
+      const widgetShell = await loadTextResource('widget-srcdoc-shell.html');
+      return {
+        pageCss,
+        pageScript,
+        widgetThemeCss,
+        widgetShell,
+      };
+    })();
+  }
+  return exportResourceCache;
+}
+
 async function loadPretextBundleText() {
   if (!pretextBundlePromise) {
     pretextBundlePromise = (async () => {
@@ -157,6 +366,7 @@ function stringifyDebugDetail(detail) {
 
 async function appendDebugLog(source, event, detail = null) {
   try {
+    if (!loadDebugModeEnabled()) return;
     if (!chrome.storage || !chrome.storage.local) return;
     const payload = {
       at: new Date().toISOString(),
@@ -190,6 +400,7 @@ function readPageDebugLog() {
 
 async function flushPageDebugLog(tabId, fallbackSource = 'page') {
   if (!tabId) return;
+  if (!loadDebugModeEnabled()) return;
   try {
     const [result] = await chrome.scripting.executeScript({
       target: { tabId },
