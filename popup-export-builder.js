@@ -706,6 +706,10 @@ function extractAndBuild(runId, options) {
     return `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m9 6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"></path></svg>`;
   }
 
+  function collapseAllIconSvg() {
+    return `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m7 9 5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"></path><path d="m7 5 5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"></path><path d="M5 19h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"></path></svg>`;
+  }
+
   function escapeInlineScriptText(value) {
     return String(value || '').replace(/<\/script/gi, '<\\/script');
   }
@@ -1619,9 +1623,19 @@ window.__pretext = (typeof pretextExports !== 'undefined' && pretextExports)
   ${promptTocHtml}
   ${widgetTocHtml}
   <div class="chat-container">
-    <h1 class="chat-title">💬 ${escHtml(chatTitle)}</h1>
-    <div class="page-actions">
-      <button type="button" class="page-action-btn" id="toggleAllRepliesBtn" data-bulk-reply-toggle aria-expanded="true">全部折叠回复</button>
+    <div class="page-header">
+      <h1 class="chat-title">💬 ${escHtml(chatTitle)}</h1>
+      <div class="page-actions">
+        <button
+          type="button"
+          class="page-action-icon-btn"
+          id="toggleAllRepliesBtn"
+          data-bulk-reply-toggle
+          aria-expanded="true"
+          aria-label="全部折叠回复"
+          title="全部折叠回复"
+        >${collapseAllIconSvg()}</button>
+      </div>
     </div>
     ${turnsHtml.join('\n')}
   </div>

@@ -682,7 +682,9 @@ function syncBulkReplyToggleButton() {
   button.hidden = false;
   const hasExpanded = wraps.some((wrap) => wrap.dataset.state !== 'collapsed');
   button.setAttribute('aria-expanded', hasExpanded ? 'true' : 'false');
-  button.textContent = hasExpanded ? '全部折叠回复' : '全部展开回复';
+  const label = hasExpanded ? '全部折叠回复' : '全部展开回复';
+  button.setAttribute('aria-label', label);
+  button.setAttribute('title', label);
 }
 
 function syncReplyToggle(toggle, expanded) {
