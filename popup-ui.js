@@ -248,6 +248,7 @@ async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAft
   setStatus(selectedUuids ? '正在提取选中消息…' : '正在提取聊天记录…');
 
   try {
+    await ensureClaudePageAdapter(tab.id);
     const runId = `claude-export-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     let pollTimer = null;
     let pollBusy = false;
@@ -392,6 +393,7 @@ if (selectMsgBtn) {
     let tab = null;
     try {
       tab = await getActiveClaudeTab();
+      await ensureClaudePageAdapter(tab.id);
       await appendDebugLog('popup', 'select-mode-click', { tabId: tab.id });
       const includeThinking = Boolean(document.getElementById('includeThinking')?.checked);
       const enableRename = Boolean(document.getElementById('enableRename')?.checked);

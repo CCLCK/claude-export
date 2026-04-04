@@ -20,91 +20,17 @@ function extractMessageList() {
     if (debugStore.length > 200) debugStore.splice(0, debugStore.length - 200);
   };
   pushDebug('start');
-
-  function joinTextContentPartsLocal(parts, separator = '\n') {
-    const blocks = Array.isArray(parts)
-      ? parts
-          .filter((part) => part && part.type === 'text')
-          .map((part) => String(part.text || ''))
-          .filter((part) => part.length > 0)
-      : [];
-    let combined = '';
-    for (const block of blocks) {
-      if (!combined) {
-        combined = block;
-        continue;
-      }
-      const prevEndsWithWhitespace = /[\s\n]$/.test(combined);
-      const nextStartsWithWhitespace = /^[\s\n]/.test(block);
-      combined += (prevEndsWithWhitespace || nextStartsWithWhitespace) ? '' : separator;
-      combined += block;
-    }
-    return combined;
+  const adapter = window.__CLAUDE_EXPORT_PAGE_ADAPTER || null;
+  if (!adapter || typeof adapter.getHumanMessageList !== 'function') {
+    pushDebug('missing-page-adapter');
+    return { error: '页面桥接未就绪，请重试导出' };
   }
 
-  function findQueryClient() {
-    const root = document.getElementById('root');
-    if (!root) return null;
-    const fiberKey = Object.keys(root).find((k) => k.startsWith('__reactContainer'));
-    if (!fiberKey) return null;
-    const visited = new WeakSet();
-    function walk(fiber, depth) {
-      if (!fiber || depth > 200) return null;
-      if (visited.has(fiber)) return null;
-      visited.add(fiber);
-      try {
-        const v = fiber.memoizedProps && fiber.memoizedProps.value;
-        if (v && typeof v === 'object') {
-          if (typeof v.getQueryCache === 'function') return v;
-          if (v.client && typeof v.client.getQueryCache === 'function') return v.client;
-        }
-      } catch (error) {}
-      return walk(fiber.child, depth + 1) || walk(fiber.sibling, depth);
-    }
-    return walk(root[fiberKey], 0);
+  const payload = adapter.getHumanMessageList();
+  if (!payload || payload.error) {
+    pushDebug('human-list-failed', { error: payload && payload.error ? payload.error : 'unknown' });
+    return { error: payload && payload.error ? payload.error : '对话数据未找到，请确保页面已完整加载' };
   }
-
-  const currentChatUuid = window.location.pathname.split('/').pop();
-  const qc = findQueryClient();
-  if (!qc) {
-    pushDebug('no-query-client');
-    return { error: 'React Query Client 未找到，请确保页面已完整加载' };
-  }
-
-  const allQueries = qc.getQueryCache().getAll();
-  const treeQuery = allQueries.find((q) =>
-    JSON.stringify(q.queryKey || '').includes(currentChatUuid)
-    && q.state.data && q.state.data.chat_messages
-  );
-  if (!treeQuery || !treeQuery.state.data) {
-    pushDebug('no-tree-query');
-    return { error: '对话数据未找到，请确保页面已完整加载' };
-  }
-
-  const msgs = (treeQuery.state.data.chat_messages || [])
-    .slice()
-    .sort((a, b) => (a.index || 0) - (b.index || 0));
-
-  const payload = {
-    title: treeQuery.state.data.name || 'Claude Chat',
-    messages: msgs
-      .filter((msg) => msg.sender === 'human')
-      .map((msg) => {
-        const contentParts = Array.isArray(msg.content) ? msg.content : [];
-        const text = joinTextContentPartsLocal(contentParts, '\n')
-          .replace(/\s+/g, ' ')
-          .trim()
-          .slice(0, 80);
-        const attachCount = (msg.attachments || []).length + (msg.files || []).length;
-        return {
-          uuid: String(msg.uuid || msg.index || ''),
-          index: msg.index || 0,
-          sender: msg.sender,
-          preview: text || (attachCount > 0 ? `[${attachCount} 个附件]` : '（空）'),
-          hasAttach: attachCount > 0,
-        };
-      }),
-  };
   pushDebug('success', { title: payload.title, count: payload.messages.length });
   return payload;
 }
@@ -169,65 +95,19 @@ function installSelectUI(config) {
     pushDebug('already-active');
     return { ok: true, alreadyActive: true };
   }
-
-  function joinTextContentPartsLocal(parts, separator = '\n') {
-    const blocks = Array.isArray(parts)
-      ? parts
-          .filter((part) => part && part.type === 'text')
-          .map((part) => String(part.text || ''))
-          .filter((part) => part.length > 0)
-      : [];
-    let combined = '';
-    for (const block of blocks) {
-      if (!combined) {
-        combined = block;
-        continue;
-      }
-      const prevEndsWithWhitespace = /[\s\n]$/.test(combined);
-      const nextStartsWithWhitespace = /^[\s\n]/.test(block);
-      combined += (prevEndsWithWhitespace || nextStartsWithWhitespace) ? '' : separator;
-      combined += block;
-    }
-    return combined;
+  const adapter = window.__CLAUDE_EXPORT_PAGE_ADAPTER || null;
+  if (!adapter || typeof adapter.getConversationSnapshot !== 'function' || typeof adapter.joinTextContentParts !== 'function') {
+    pushDebug('missing-page-adapter');
+    return { ok: false, error: '页面桥接未就绪，请重试导出' };
   }
 
-  function findQueryClient() {
-    const root = document.getElementById('root');
-    if (!root) return null;
-    const fiberKey = Object.keys(root).find((k) => k.startsWith('__reactContainer'));
-    if (!fiberKey) return null;
-    const visited = new WeakSet();
-    function walk(fiber, depth) {
-      if (!fiber || depth > 200) return null;
-      if (visited.has(fiber)) return null;
-      visited.add(fiber);
-      try {
-        const v = fiber.memoizedProps && fiber.memoizedProps.value;
-        if (v && typeof v === 'object') {
-          if (typeof v.getQueryCache === 'function') return v;
-          if (v.client && typeof v.client.getQueryCache === 'function') return v.client;
-        }
-      } catch (error) {}
-      return walk(fiber.child, depth + 1) || walk(fiber.sibling, depth);
-    }
-    return walk(root[fiberKey], 0);
+  const snapshot = adapter.getConversationSnapshot();
+  if (!snapshot || snapshot.error) {
+    pushDebug('snapshot-failed', { error: snapshot && snapshot.error ? snapshot.error : 'unknown' });
+    return { ok: false, error: snapshot && snapshot.error ? snapshot.error : '对话数据未找到，请确保页面已完整加载' };
   }
 
-  const currentChatUuid = window.location.pathname.split('/').pop();
-  const qc = findQueryClient();
-  if (!qc) return { ok: false, error: 'React Query Client 未找到，请确保页面已完整加载' };
-
-  const allQueries = qc.getQueryCache().getAll();
-  const treeQuery = allQueries.find((q) =>
-    JSON.stringify(q.queryKey || '').includes(currentChatUuid) &&
-    q.state.data && q.state.data.chat_messages
-  );
-  if (!treeQuery) return { ok: false, error: '对话数据未找到，请确保页面已完整加载' };
-
-  const humanMessages = (treeQuery.state.data.chat_messages || [])
-    .slice()
-    .sort((a, b) => (a.index || 0) - (b.index || 0))
-    .filter((msg) => msg.sender === 'human');
+  const humanMessages = snapshot.messages.filter((msg) => msg.sender === 'human');
 
   const style = document.createElement('style');
   style.id = '__claude-export-select-style';
@@ -490,7 +370,7 @@ function installSelectUI(config) {
 
   function buildPreview(msg, index) {
     const contentParts = Array.isArray(msg && msg.content) ? msg.content : [];
-    const text = joinTextContentPartsLocal(contentParts, '\n')
+    const text = adapter.joinTextContentParts(contentParts, '\n')
       .replace(/\s+/g, ' ')
       .trim();
     const attachCount = ((msg && msg.attachments) || []).length + ((msg && msg.files) || []).length;
@@ -723,4 +603,3 @@ function installSelectUI(config) {
   pushDebug('ready', { selectableCount: turnData.length });
   return { ok: true, alreadyActive: false, count: turnData.length };
 }
-

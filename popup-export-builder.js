@@ -30,7 +30,7 @@ function extractAndBuild(runId, options) {
     });
     if (debugStore.length > 300) debugStore.splice(0, debugStore.length - 300);
   };
-  function joinTextContentPartsLocal(parts, separator = '\n') {
+  function joinTextContentPartsFallback(parts, separator = '\n') {
     const blocks = Array.isArray(parts)
       ? parts
           .filter((part) => part && part.type === 'text')
@@ -49,6 +49,18 @@ function extractAndBuild(runId, options) {
       combined += block;
     }
     return combined;
+  }
+  function getPageAdapter() {
+    const adapter = window.__CLAUDE_EXPORT_PAGE_ADAPTER || null;
+    if (!adapter || typeof adapter.getConversationSnapshot !== 'function') return null;
+    return adapter;
+  }
+  function joinTextContentParts(parts, separator = '\n') {
+    const adapter = getPageAdapter();
+    if (adapter && typeof adapter.joinTextContentParts === 'function') {
+      return adapter.joinTextContentParts(parts, separator);
+    }
+    return joinTextContentPartsFallback(parts, separator);
   }
   const normalizeWidgetImageExport = (value) => {
     const preset = value && typeof value === 'object' ? value : {};
@@ -403,6 +415,85 @@ function extractAndBuild(runId, options) {
     return labelMap[normalized] || normalized.toUpperCase();
   }
 
+  function splitMarkdownTableRow(line) {
+    return line
+      .trim()
+      .replace(/^\|/, '')
+      .replace(/\|$/, '')
+      .split('|')
+      .map((cell) => cell.trim());
+  }
+
+  function isMarkdownTableBlock(block) {
+    const lines = block.split('\n').map((line) => line.trim()).filter(Boolean);
+    if (lines.length < 2) return false;
+    const headerOk = /^\|?.+\|.+\|?$/.test(lines[0]);
+    const dividerOk = /^\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?$/.test(lines[1]);
+    return headerOk && dividerOk;
+  }
+
+  function parseMarkdownTableAlignments(line) {
+    return splitMarkdownTableRow(line).map((cell) => {
+      const trimmed = cell.trim();
+      const left = trimmed.startsWith(':');
+      const right = trimmed.endsWith(':');
+      if (left && right) return 'center';
+      if (right) return 'right';
+      if (left) return 'left';
+      return '';
+    });
+  }
+
+  function renderMarkdownTable(block) {
+    const lines = block.split('\n').map((line) => line.trim()).filter(Boolean);
+    const headers = splitMarkdownTableRow(lines[0]);
+    const aligns = parseMarkdownTableAlignments(lines[1]);
+    const rows = lines.slice(2).map(splitMarkdownTableRow);
+    const cellStyle = (idx) => aligns[idx] ? ` style="text-align: ${aligns[idx]}"` : '';
+    const thead = `<thead><tr>${headers.map((cell, idx) => `<th${cellStyle(idx)}>${cell}</th>`).join('')}</tr></thead>`;
+    const tbody = `<tbody>${rows.map((row) =>
+      `<tr>${row.map((cell, idx) => `<td${cellStyle(idx)}>${cell}</td>`).join('')}</tr>`
+    ).join('')}</tbody>`;
+    return `<table>${thead}${tbody}</table>`;
+  }
+
+  function isMarkdownBlockquoteBlock(block) {
+    const lines = block.split('\n').map((line) => line.trim()).filter(Boolean);
+    return lines.length > 0 && lines.every((line) => /^>\s?/.test(line));
+  }
+
+  function renderMarkdownBlocks(html, renderNestedMarkdown) {
+    return html.split(/\n{2,}/).map((block) => {
+      const trimmedBlock = block.trim();
+      if (!trimmedBlock) return '';
+      if (isMarkdownTableBlock(trimmedBlock)) return renderMarkdownTable(trimmedBlock);
+      if (isMarkdownBlockquoteBlock(trimmedBlock)) {
+        const inner = trimmedBlock
+          .split('\n')
+          .map((line) => line.replace(/^>\s?/, ''))
+          .join('\n')
+          .trim();
+        return `<blockquote>${renderNestedMarkdown(inner)}</blockquote>`;
+      }
+      if (/^<(h[1-6]|ul|ol|pre|hr|blockquote|table)/.test(trimmedBlock)) return trimmedBlock;
+      return `<p>${trimmedBlock.replace(/\n/g, '<br>')}</p>`;
+    }).filter(Boolean).join('\n');
+  }
+
+  function cleanupRenderedMarkdownHtml(html) {
+    let nextHtml = html;
+    nextHtml = nextHtml.replace(/<p>([\s\S]*?)<br>\s*(<(?:ul|ol)>[\s\S]*?<\/(?:ul|ol)>)<\/p>/g, (_, intro, list) => {
+      const paragraph = intro.trim() ? `<p>${intro.trim()}</p>` : '';
+      return `${paragraph}\n${list}`;
+    });
+    nextHtml = nextHtml.replace(/<p>\s*(<(?:ul|ol)>[\s\S]*?<\/(?:ul|ol)>)\s*<\/p>/g, '$1');
+    nextHtml = nextHtml.replace(/<p>\s*(<div class="code-block">[\s\S]*?<\/div>)\s*<\/p>/g, '$1');
+    nextHtml = nextHtml.replace(/<(ul|ol)>\s*<br\s*\/?>/g, '<$1>');
+    nextHtml = nextHtml.replace(/<br\s*\/?>\s*<\/(ul|ol)>/g, '</$1>');
+    nextHtml = nextHtml.replace(/<\/li>\s*<br\s*\/?>\s*<li>/g, '</li><li>');
+    return nextHtml;
+  }
+
   // ── 工具：轻量 Markdown → HTML（无外部依赖）────────────────────
   function md2html(text) {
     if (!text || !text.trim()) return '';
@@ -503,88 +594,13 @@ function extractAndBuild(runId, options) {
     if (inOl) buf.push('</ol>');
     html = buf.join('\n');
 
-    function splitTableRow(line) {
-      return line
-        .trim()
-        .replace(/^\|/, '')
-        .replace(/\|$/, '')
-        .split('|')
-        .map(cell => cell.trim());
-    }
-
-    function isTableBlock(block) {
-      const lines = block.split('\n').map(line => line.trim()).filter(Boolean);
-      if (lines.length < 2) return false;
-      const headerOk = /^\|?.+\|.+\|?$/.test(lines[0]);
-      const dividerOk = /^\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?$/.test(lines[1]);
-      return headerOk && dividerOk;
-    }
-
-    function parseTableAlignments(line) {
-      return splitTableRow(line).map(cell => {
-        const trimmed = cell.trim();
-        const left = trimmed.startsWith(':');
-        const right = trimmed.endsWith(':');
-        if (left && right) return 'center';
-        if (right) return 'right';
-        if (left) return 'left';
-        return '';
-      });
-    }
-
-    function renderTable(block) {
-      const lines = block.split('\n').map(line => line.trim()).filter(Boolean);
-      const headers = splitTableRow(lines[0]);
-      const aligns = parseTableAlignments(lines[1]);
-      const rows = lines.slice(2).map(splitTableRow);
-      const cellStyle = idx => aligns[idx] ? ` style="text-align: ${aligns[idx]}"` : '';
-      const thead = `<thead><tr>${headers.map((cell, idx) => `<th${cellStyle(idx)}>${cell}</th>`).join('')}</tr></thead>`;
-      const tbody = `<tbody>${rows.map(row =>
-        `<tr>${row.map((cell, idx) => `<td${cellStyle(idx)}>${cell}</td>`).join('')}</tr>`
-      ).join('')}</tbody>`;
-      return `<table>${thead}${tbody}</table>`;
-    }
-
-    function isBlockquoteBlock(block) {
-      const lines = block.split('\n').map(line => line.trim()).filter(Boolean);
-      return lines.length > 0 && lines.every(line => /^>\s?/.test(line));
-    }
-
-    function renderBlockquote(block) {
-      const inner = block
-        .split('\n')
-        .map(line => line.replace(/^>\s?/, ''))
-        .join('\n')
-        .trim();
-      return `<blockquote>${md2html(inner)}</blockquote>`;
-    }
-
-    // 段落 / 表格 / 引用
-    html = html.split(/\n{2,}/).map(block => {
-      block = block.trim();
-      if (!block) return '';
-      if (isTableBlock(block)) return renderTable(block);
-      if (isBlockquoteBlock(block)) return renderBlockquote(block);
-      if (/^<(h[1-6]|ul|ol|pre|hr|blockquote|table)/.test(block)) return block;
-      return `<p>${block.replace(/\n/g, '<br>')}</p>`;
-    }).filter(Boolean).join('\n');
+    html = renderMarkdownBlocks(html, md2html);
 
     html = html.replace(/<p>(%%CB\d+%%)<\/p>/g, '$1');
     inlineTokens.forEach((fragment, i) => { html = html.replaceAll(`%%IN${i}%%`, fragment); });
-    // 修正“标题句 + 列表”被包进同一个 p 的非法结构
-    html = html.replace(/<p>([\s\S]*?)<br>\s*(<(?:ul|ol)>[\s\S]*?<\/(?:ul|ol)>)<\/p>/g, (_, intro, list) => {
-      const paragraph = intro.trim() ? `<p>${intro.trim()}</p>` : '';
-      return `${paragraph}\n${list}`;
-    });
-    html = html.replace(/<p>\s*(<(?:ul|ol)>[\s\S]*?<\/(?:ul|ol)>)\s*<\/p>/g, '$1');
     // 恢复代码块
     codeBlocks.forEach((cb, i) => { html = html.replace(`%%CB${i}%%`, cb); });
-    html = html.replace(/<p>\s*(<div class="code-block">[\s\S]*?<\/div>)\s*<\/p>/g, '$1');
-    // 清理列表内部被错误注入的 <br>
-    html = html.replace(/<(ul|ol)>\s*<br\s*\/?>/g, '<$1>');
-    html = html.replace(/<br\s*\/?>\s*<\/(ul|ol)>/g, '</$1>');
-    html = html.replace(/<\/li>\s*<br\s*\/?>\s*<li>/g, '</li><li>');
-    return html;
+    return cleanupRenderedMarkdownHtml(html);
   }
 
   function renderAttachmentDialog(att, dialogId) {
@@ -916,16 +932,27 @@ function extractAndBuild(runId, options) {
   };
   const measureContentHeight = () => {
     const body = document.body;
-    if (!body) return 120;
+    const root = document.documentElement;
+    if (!body || !root) return 120;
     const bodyRect = body.getBoundingClientRect();
     const bodyStyle = getComputedStyle(body);
     const paddingBottom = parseFloat(bodyStyle.paddingBottom || '0') || 0;
-    const candidates = Array.from(body.children).filter((el) => el.tagName !== 'SCRIPT');
+    const candidates = Array.from(body.querySelectorAll('*')).filter((el) => el.tagName !== 'SCRIPT');
+    const viewportHeight = Math.max(body.clientHeight || 0, root.clientHeight || 0);
 
     let maxBottom = 0;
     for (const el of candidates) {
+      const rect = el.getBoundingClientRect();
+      const isViewportTetheredWrapper =
+        el.children &&
+        el.children.length > 0 &&
+        viewportHeight > 0 &&
+        rect.height >= viewportHeight * 0.9 &&
+        rect.bottom >= bodyRect.top + viewportHeight * 0.9 &&
+        rect.top <= bodyRect.top + 24;
+      if (isViewportTetheredWrapper) continue;
       if (el.tagName === 'svg' || el.tagName === 'SVG') {
-        const svgRect = el.getBoundingClientRect();
+        const svgRect = rect;
         const viewBox = el.viewBox && el.viewBox.baseVal;
         if (svgRect.width && svgRect.height && viewBox && viewBox.height > 0) {
           try {
@@ -939,16 +966,24 @@ function extractAndBuild(runId, options) {
           } catch (e) {}
         }
       }
-      const rect = el.getBoundingClientRect();
       if (!rect.width && !rect.height) continue;
       maxBottom = Math.max(maxBottom, rect.bottom - bodyRect.top);
     }
 
-    if (maxBottom <= 0) {
-      maxBottom = body.scrollHeight || body.offsetHeight || 0;
-    }
+    const contentHeight = Math.max(120, Math.ceil(maxBottom + paddingBottom + 2));
+    const fallbackHeight = Math.max(
+      120,
+      Math.ceil(body.scrollHeight || 0),
+      Math.ceil(body.offsetHeight || 0),
+      Math.ceil(root.scrollHeight || 0),
+      Math.ceil(root.offsetHeight || 0)
+    );
 
-    return Math.max(120, Math.ceil(maxBottom + paddingBottom + 2));
+    // If we saw DOM nodes but could not derive a stable bottom edge, treat the
+    // result as unreliable instead of echoing the current iframe viewport back
+    // to the parent. Otherwise tall widgets can get stuck at a clipped height.
+    if (maxBottom > 0) return contentHeight;
+    return candidates.length > 0 ? 0 : fallbackHeight;
   };
   const postHeight = () => {
     parent.postMessage({ type: 'claude-export-widget-height', frameId, height: measureContentHeight() }, '*');
@@ -1006,7 +1041,17 @@ function extractAndBuild(runId, options) {
       1,
       Math.ceil(document.documentElement.scrollWidth || body.scrollWidth || body.getBoundingClientRect().width || 1)
     );
-    const exportHeight = Math.max(1, measureContentHeight());
+    const measuredHeight = Math.max(0, Math.ceil(measureContentHeight() || 0));
+    const exportHeight = Math.max(
+      1,
+      measuredHeight,
+      Math.ceil(document.documentElement.scrollHeight || 0),
+      Math.ceil(document.documentElement.offsetHeight || 0),
+      Math.ceil(body.scrollHeight || 0),
+      Math.ceil(body.offsetHeight || 0),
+      Math.ceil(body.getBoundingClientRect().height || 0),
+      Math.ceil(window.innerHeight || 0)
+    );
     const captureScale = Math.max(1, Number(scale || defaultCaptureScale) || defaultCaptureScale);
     const bodyClone = body.cloneNode(true);
     bodyClone.querySelectorAll('script').forEach((node) => node.remove());
@@ -1069,12 +1114,20 @@ function extractAndBuild(runId, options) {
   window.addEventListener('load', () => {
     postHeight();
     setTimeout(postHeight, 100);
+    setTimeout(postHeight, 300);
     setTimeout(postHeight, 500);
+    setTimeout(postHeight, 1000);
   });
   window.addEventListener('resize', postHeight);
   document.addEventListener('readystatechange', postHeight);
   window.addEventListener('message', (event) => {
     const data = event.data || {};
+    if (data.type === 'claude-export-widget-height-request') {
+      if (data.frameId && data.frameId !== frameId) return;
+      requestAnimationFrame(postHeight);
+      setTimeout(postHeight, 60);
+      return;
+    }
     if (data.type !== 'claude-export-widget-capture-request') return;
     if (data.frameId && data.frameId !== frameId) return;
     respondWidgetCapture(
@@ -1085,72 +1138,319 @@ function extractAndBuild(runId, options) {
   });
 })();
 <\/script>`;
+    const sanitizedWidgetCode = sanitizeWidgetCodeForExport(widgetCode);
     const widgetThemeCss = widgetThemeCssResource || '';
     const widgetShell = widgetShellResource || '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="UTF-8">\n<style>\n__WIDGET_THEME_CSS__\n</style>\n</head>\n<body>__WIDGET_CODE__</body>\n__WIDGET_RUNTIME_SCRIPT__\n</html>\n';
     const inner = widgetShell
       .replace('__WIDGET_THEME_CSS__', widgetThemeCss)
-      .replace('__WIDGET_CODE__', widgetCode)
+      .replace('__WIDGET_CODE__', sanitizedWidgetCode)
       .replace('__WIDGET_RUNTIME_SCRIPT__', resizeScript);
     return inner.replace(/"/g, '&quot;');
   }
 
-  // ── 找 React Query Client（遍历 Fiber 树）──────────────────────
-  function findQueryClient() {
-    const root = document.getElementById('root');
-    if (!root) return null;
-    const fiberKey = Object.keys(root).find(k => k.startsWith('__reactContainer'));
-    if (!fiberKey) return null;
+  function sanitizeWidgetCodeForExport(widgetCode) {
+    const source = String(widgetCode || '');
+    const codeLineMarkers = ['class="code-line', "class='code-line"];
+    let output = '';
+    let cursor = 0;
 
-    const visited = new WeakSet();
-    function walk(fiber, depth) {
-      if (!fiber || depth > 200) return null;
-      if (visited.has(fiber)) return null;
-      visited.add(fiber);
-      try {
-        const v = fiber.memoizedProps && fiber.memoizedProps.value;
-        if (v && typeof v === 'object') {
-          if (typeof v.getQueryCache === 'function') return v;
-          if (v.client && typeof v.client.getQueryCache === 'function') return v.client;
+    while (cursor < source.length) {
+      let codeLineIndex = -1;
+      let markerValue = '';
+      for (const marker of codeLineMarkers) {
+        const idx = source.indexOf(marker, cursor);
+        if (idx !== -1 && (codeLineIndex === -1 || idx < codeLineIndex)) {
+          codeLineIndex = idx;
+          markerValue = marker;
         }
-      } catch (e) {}
-      return walk(fiber.child, depth + 1) || walk(fiber.sibling, depth);
+      }
+      if (codeLineIndex === -1) {
+        output += source.slice(cursor);
+        break;
+      }
+      const openStart = source.lastIndexOf('<div', codeLineIndex);
+      if (openStart === -1) {
+        output += source.slice(cursor, codeLineIndex + markerValue.length);
+        cursor = codeLineIndex + markerValue.length;
+        continue;
+      }
+      const openEnd = source.indexOf('>', codeLineIndex + markerValue.length);
+      if (openEnd === -1) {
+        output += source.slice(cursor);
+        break;
+      }
+      const closeStart = source.indexOf('</span>', openEnd + 1);
+      const divCloseStart = source.indexOf('</div>', openEnd + 1);
+      if (divCloseStart === -1) {
+        output += source.slice(cursor);
+        break;
+      }
+      const rawInner = source.slice(openEnd + 1, divCloseStart);
+      output += source.slice(cursor, openEnd + 1);
+      output += sanitizeCodeLineInnerHtml(rawInner);
+      output += '</div>';
+      cursor = divCloseStart + 6;
     }
-    return walk(root[fiberKey], 0);
+
+    return sanitizeSvgTextNodeContent(output);
+  }
+
+  function sanitizeSvgTextNodeContent(widgetHtml) {
+    const source = String(widgetHtml || '');
+    let output = '';
+    let cursor = 0;
+
+    while (cursor < source.length) {
+      const textOpen = source.indexOf('<text', cursor);
+      if (textOpen === -1) {
+        output += source.slice(cursor);
+        break;
+      }
+      const tagEnd = source.indexOf('>', textOpen + 5);
+      if (tagEnd === -1) {
+        output += source.slice(cursor);
+        break;
+      }
+      const textClose = source.indexOf('</text>', tagEnd + 1);
+      if (textClose === -1) {
+        output += source.slice(cursor);
+        break;
+      }
+
+      const rawInner = source.slice(tagEnd + 1, textClose);
+      output += source.slice(cursor, tagEnd + 1);
+      if (rawInner.includes('<') && !rawInner.includes('<tspan')) {
+        output += escapeSvgTextForSrcdoc(rawInner);
+      } else {
+        output += rawInner;
+      }
+      output += '</text>';
+      cursor = textClose + 7;
+    }
+
+    return output;
+  }
+
+  function escapeSvgTextForSrcdoc(text) {
+    return escHtml(escHtml(text));
+  }
+
+  function sanitizeCodeLineInnerHtml(innerHtml) {
+    const source = String(innerHtml || '');
+    if (!source.includes('<span')) {
+      return escHtml(source);
+    }
+    let output = '';
+    let cursor = 0;
+
+    while (cursor < source.length) {
+      const atOpenSpan = source.startsWith('<span', cursor);
+      const atCloseSpan = source.startsWith('</span', cursor);
+
+      if (atOpenSpan || atCloseSpan) {
+        const tagEnd = source.indexOf('>', cursor + 1);
+        if (tagEnd === -1) {
+          output += escHtml(source.slice(cursor));
+          break;
+        }
+        output += source.slice(cursor, tagEnd + 1);
+        cursor = tagEnd + 1;
+        continue;
+      }
+
+      let nextAllowed = source.indexOf('<span', cursor);
+      const nextCloseSpan = source.indexOf('</span', cursor);
+      if (nextAllowed === -1 || (nextCloseSpan !== -1 && nextCloseSpan < nextAllowed)) {
+        nextAllowed = nextCloseSpan;
+      }
+      const chunkEnd = nextAllowed === -1 ? source.length : nextAllowed;
+      output += escHtml(source.slice(cursor, chunkEnd));
+      cursor = chunkEnd;
+    }
+
+    return finalizeSanitizedCodeLineInnerHtml(output);
+  }
+
+  function finalizeSanitizedCodeLineInnerHtml(innerHtml) {
+    const emptyTagMarker = '<span class="t-tag"></span>';
+    if (!innerHtml.includes(emptyTagMarker)) return innerHtml;
+
+    const literalStart = innerHtml.indexOf('&lt;');
+    if (literalStart === -1) return innerHtml;
+
+    let tagName = '';
+    let cursor = literalStart + 4;
+    while (cursor < innerHtml.length) {
+      const ch = innerHtml[cursor];
+      if (
+        (ch >= 'a' && ch <= 'z') ||
+        (ch >= 'A' && ch <= 'Z') ||
+        (ch >= '0' && ch <= '9') ||
+        ch === '-' ||
+        ch === ':'
+      ) {
+        tagName += ch;
+        cursor += 1;
+        continue;
+      }
+      break;
+    }
+    if (!tagName) return innerHtml;
+
+    const closingLiteral = `&lt;/${tagName}&gt;`;
+    if (innerHtml.includes(closingLiteral)) return innerHtml;
+
+    return innerHtml.split(emptyTagMarker).join(`<span class="t-tag">${closingLiteral}</span>`);
+  }
+
+  function guessInitialWidgetHeight(widgetCode) {
+    const source = String(widgetCode || '');
+    const lower = source.toLowerCase();
+    const viewBoxMatch = source.match(/viewBox\s*=\s*["']\s*[-\d.]+\s+[-\d.]+\s+([-\d.]+)\s+([-\d.]+)\s*["']/i);
+    const widthMatch = source.match(/\bwidth\s*=\s*["']\s*([-\d.]+)(px)?\s*["']/i);
+    const heightMatch = source.match(/\bheight\s*=\s*["']\s*([-\d.]+)(px)?\s*["']/i);
+    const estimateSvgHeight = () => {
+      let viewWidth = 0;
+      let viewHeight = 0;
+      if (viewBoxMatch) {
+        viewWidth = Number(viewBoxMatch[1]) || 0;
+        viewHeight = Number(viewBoxMatch[2]) || 0;
+      }
+      const explicitWidth = widthMatch ? (Number(widthMatch[1]) || 0) : 0;
+      const explicitHeight = heightMatch ? (Number(heightMatch[1]) || 0) : 0;
+      if (viewWidth > 0 && viewHeight > 0) {
+        const assumedFrameWidth = 860;
+        const scaled = Math.ceil((viewHeight / viewWidth) * assumedFrameWidth);
+        return Math.max(180, Math.min(1400, scaled + 12));
+      }
+      if (explicitHeight > 0) {
+        return Math.max(180, Math.min(1400, Math.ceil(explicitHeight) + 12));
+      }
+      if (explicitWidth > 0 && explicitHeight > 0) {
+        return Math.max(180, Math.min(1400, Math.ceil(explicitHeight) + 12));
+      }
+      return 360;
+    };
+    const estimateGridWidgetHeight = () => {
+      const cardLikeCount = (source.match(/class\s*=\s*["'][^"']*(?:item-card|info-card|screen-mock|surface-card|neutral-card|word-chip|anno)[^"']*["']/gi) || []).length;
+      if (cardLikeCount === 0) return 0;
+      const sectionLabelCount = (source.match(/class\s*=\s*["'][^"']*(?:section-label|section-header|preview-label)[^"']*["']/gi) || []).length;
+      let columns = 1;
+      if (/grid-template-columns\s*:\s*1fr\s+1fr\s+1fr/i.test(source) || /repeat\(\s*3\s*,/i.test(lower)) {
+        columns = 3;
+      } else if (
+        /grid-template-columns\s*:\s*1fr\s+1fr/i.test(source) ||
+        /repeat\(\s*2\s*,/i.test(lower) ||
+        /auto-fill/i.test(lower) ||
+        /auto-fit/i.test(lower) ||
+        /minmax\(/i.test(lower)
+      ) {
+        columns = 2;
+      }
+      const rows = Math.ceil(cardLikeCount / columns);
+      const estimated = 210 + (rows * 155) + (sectionLabelCount * 40) + (cardLikeCount > columns ? 80 : 0);
+      return Math.max(520, Math.min(2200, estimated));
+    };
+    const layoutHints = [
+      'grid-template-columns',
+      'display:grid',
+      'display: grid',
+      'class="layout"',
+      "class='layout'",
+      'class="pane"',
+      "class='pane'",
+      'minmax(',
+      'repeat(',
+      'split-view',
+      'two-col',
+      'dom tree',
+    ];
+    let cursor = 0;
+
+    while (cursor < lower.length) {
+      const open = lower.indexOf('<', cursor);
+      if (open === -1) break;
+      if (lower.startsWith('<!--', open)) {
+        const close = lower.indexOf('-->', open + 4);
+        cursor = close === -1 ? lower.length : close + 3;
+        continue;
+      }
+      const next = lower.charCodeAt(open + 1);
+      const isLetter = next >= 97 && next <= 122;
+      if (!isLetter) {
+        cursor = open + 1;
+        continue;
+      }
+      let end = open + 1;
+      while (end < lower.length) {
+        const code = lower.charCodeAt(end);
+        const isTagChar =
+          (code >= 97 && code <= 122) ||
+          (code >= 48 && code <= 57) ||
+          code === 45 ||
+          code === 95;
+        if (!isTagChar) break;
+        end += 1;
+      }
+      const tag = lower.slice(open + 1, end);
+      if (tag === 'style' || tag === 'script') {
+        cursor = end;
+        continue;
+      }
+      if (tag === 'svg') return estimateSvgHeight();
+      if (layoutHints.some((hint) => lower.includes(hint))) {
+        const estimatedGridHeight = estimateGridWidgetHeight();
+        if (estimatedGridHeight > 0) return estimatedGridHeight;
+        const hasPreviewSection =
+          lower.includes('.preview') ||
+          lower.includes('preview-box') ||
+          lower.includes('preview-label') ||
+          lower.includes('浏览器渲染结果');
+        return hasPreviewSection ? 1180 : 980;
+      }
+      if (lower.includes('<table') || lower.includes('<pre') || lower.includes('<code')) return 720;
+      return 460;
+    }
+
+    if (lower.includes('<svg')) return estimateSvgHeight();
+    if (layoutHints.some((hint) => lower.includes(hint))) {
+      const estimatedGridHeight = estimateGridWidgetHeight();
+      if (estimatedGridHeight > 0) return estimatedGridHeight;
+      return 980;
+    }
+    if (lower.includes('<table') || lower.includes('<pre') || lower.includes('<code')) return 720;
+    return 460;
   }
 
   // ── 提取数据 ────────────────────────────────────────────────────
   return (async () => {
     try {
-      const currentChatUuid = window.location.pathname.split('/').pop();
-
-      const qc = findQueryClient();
-      if (!qc) {
-        return fail('React Query Client 未找到，请确保页面已完整加载');
+      const pageAdapter = getPageAdapter();
+      if (!pageAdapter) {
+        return fail('页面桥接未就绪，请重试导出');
+      }
+      const snapshot = pageAdapter.getConversationSnapshot();
+      if (!snapshot || snapshot.error) {
+        return fail(snapshot && snapshot.error ? snapshot.error : '对话数据未找到，请确保页面已完整加载');
       }
 
-      const allQueries = qc.getQueryCache().getAll();
-      const treeQuery = allQueries.find(q =>
-        JSON.stringify(q.queryKey || '').includes(currentChatUuid)
-        && q.state.data && q.state.data.chat_messages
-      );
-
-      if (!treeQuery || !treeQuery.state.data) {
-        return fail('对话数据未找到，请确保页面已完整加载');
-      }
-
+      const currentChatUuid = snapshot.chatUuid || '';
+      const chatTitle = snapshot.title || 'Claude Chat';
+      const rawChatMsgs = Array.isArray(snapshot.messages) ? snapshot.messages.slice() : [];
       let orgUuid = '';
-      for (const q of allQueries) {
-        const key = JSON.stringify(q.queryKey || '');
-        const match = key.match(/"orgUuid":"([^"]+)"/);
-        if (match) {
-          orgUuid = match[1];
-          break;
+      const queryClient = typeof pageAdapter.findQueryClient === 'function' ? pageAdapter.findQueryClient() : null;
+      if (queryClient && typeof queryClient.getQueryCache === 'function') {
+        const allQueries = queryClient.getQueryCache().getAll();
+        for (const q of allQueries) {
+          const key = JSON.stringify(q.queryKey || '');
+          const match = key.match(/"orgUuid":"([^"]+)"/);
+          if (match) {
+            orgUuid = match[1];
+            break;
+          }
         }
       }
 
-      const convData  = treeQuery.state.data;
-      const chatTitle = convData.name || 'Claude Chat';
-      const rawChatMsgs = (convData.chat_messages || []).slice().sort((a, b) => (a.index || 0) - (b.index || 0));
       const chatMsgs = selectedUuids
         ? (() => {
             const filtered = [];
@@ -1296,7 +1596,7 @@ function extractAndBuild(runId, options) {
       if (msg.sender === 'human') {
         flushPendingUserExchange();
         const contentParts = Array.isArray(msg.content) ? msg.content : [];
-        const rawTextContent = joinTextContentPartsLocal(contentParts, '\n');
+        const rawTextContent = joinTextContentParts(contentParts, '\n');
         const textContent = await inlineTextAssetUrls(rawTextContent);
 
         const messageKey = String(msg.uuid || msg.index || turnsHtml.length)
@@ -1355,7 +1655,6 @@ function extractAndBuild(runId, options) {
         const userSectionHtml = `
 <section id="${promptSectionId}" class="prompt-section">
   <div class="turn user-turn">
-    <div class="avatar ua" aria-hidden="true"></div>
     <div class="turn-stack turn-stack--user">
       <div class="bubble ub">
         ${attachHtml}
@@ -1408,6 +1707,7 @@ function extractAndBuild(runId, options) {
             const currentWidgetIndex = widgetIndex++;
             const iframeId = `widget-${messageKey}-${currentWidgetIndex}`;
             const srcdoc = makeWidgetSrcdoc(c.input.widget_code, iframeId, widgetImageExport);
+            const initialWidgetHeight = guessInitialWidgetHeight(c.input.widget_code);
             const widgetTitle = c.input.title || 'widget';
             const wTitle = escHtml(widgetTitle);
             const widgetSectionId = makeAnchorId('widget', widgetTitle, widgetTocItems.length + 1);
@@ -1450,7 +1750,7 @@ function extractAndBuild(runId, options) {
       </div>
     </div>
     <div class="widget-header">⚡ ${wTitle}</div>
-    <iframe srcdoc="${srcdoc}" sandbox="allow-scripts" class="widget-iframe" data-iframe-id="${iframeId}" loading="lazy" scrolling="no"></iframe>
+    <iframe srcdoc="${srcdoc}" sandbox="allow-scripts" class="widget-iframe" style="height: ${initialWidgetHeight}px;" data-initial-height="${initialWidgetHeight}" data-iframe-id="${iframeId}" loading="lazy" scrolling="no"></iframe>
   </div>
 </section>`);
           }
@@ -1489,7 +1789,6 @@ function extractAndBuild(runId, options) {
             const replyHtml = `
 <div class="turn claude-turn reply-shell">
   <div class="reply-side">
-    <div class="avatar ca">C</div>
     <button
       type="button"
       class="reply-toggle"
@@ -1521,7 +1820,6 @@ function extractAndBuild(runId, options) {
             const replyHtml = `
 <div class="turn claude-turn reply-shell">
   <div class="reply-side">
-    <div class="avatar ca">C</div>
     <button
       type="button"
       class="reply-toggle"

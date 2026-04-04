@@ -805,6 +805,131 @@ function findWidgetFrame(frameId) {
   return Array.from(document.querySelectorAll('.widget-iframe')).find((el) => el.dataset.iframeId === frameId) || null;
 }
 
+function requestWidgetFrameHeight(frame) {
+  if (!frame || !frame.contentWindow) return;
+  frame.contentWindow.postMessage({
+    type: 'claude-export-widget-height-request',
+    frameId: frame.dataset.iframeId || '',
+  }, '*');
+}
+
+function measureWidgetFrameContentHeight(frame) {
+  if (!frame) return 0;
+  try {
+    const doc = frame.contentDocument;
+    const body = doc && doc.body;
+    const root = doc && doc.documentElement;
+    if (!body || !root) return 0;
+
+    const bodyRect = body.getBoundingClientRect();
+    const bodyStyle = getComputedStyle(body);
+    const paddingBottom = parseFloat(bodyStyle.paddingBottom || '0') || 0;
+    let maxBottom = 0;
+    const viewportHeight = Math.max(body.clientHeight || 0, root.clientHeight || 0);
+
+    const candidates = Array.from(body.querySelectorAll('*'));
+    candidates.forEach((el) => {
+      if (el.tagName === 'SCRIPT') return;
+      const rect = el.getBoundingClientRect();
+      const isViewportTetheredWrapper =
+        el.children &&
+        el.children.length > 0 &&
+        viewportHeight > 0 &&
+        rect.height >= viewportHeight * 0.9 &&
+        rect.bottom >= bodyRect.top + viewportHeight * 0.9 &&
+        rect.top <= bodyRect.top + 24;
+      if (isViewportTetheredWrapper) return;
+      if (el.tagName === 'svg' || el.tagName === 'SVG') {
+        const svgRect = rect;
+        const viewBox = el.viewBox && el.viewBox.baseVal;
+        if (svgRect.width && svgRect.height && viewBox && viewBox.height > 0) {
+          try {
+            const bbox = el.getBBox();
+            if (bbox && Number.isFinite(bbox.y) && Number.isFinite(bbox.height) && bbox.height > 0) {
+              const contentBottom = Math.min(viewBox.height, bbox.y + bbox.height);
+              const scaledHeight = (contentBottom / viewBox.height) * svgRect.height;
+              maxBottom = Math.max(maxBottom, (svgRect.top - bodyRect.top) + scaledHeight + 2);
+              return;
+            }
+          } catch (error) {}
+        }
+      }
+      if (!rect.width && !rect.height) return;
+      maxBottom = Math.max(maxBottom, rect.bottom - bodyRect.top);
+    });
+
+    const contentHeight = Math.max(120, Math.ceil(maxBottom + paddingBottom + 2));
+    const fallbackHeight = Math.max(
+      120,
+      Math.ceil(body.scrollHeight || 0),
+      Math.ceil(body.offsetHeight || 0),
+      Math.ceil(root.scrollHeight || 0),
+      Math.ceil(root.offsetHeight || 0)
+    );
+
+    // Ignore scrollHeight-based values when we saw DOM nodes but failed to
+    // derive a trustworthy content bottom. In that state scrollHeight often
+    // just mirrors the current clipped iframe viewport.
+    if (maxBottom > 0) return contentHeight;
+    return candidates.length > 0 ? 0 : fallbackHeight;
+  } catch (error) {
+    appendRuntimeDebugLog('widget', 'frame-height-measure-failed', {
+      frameId: frame.dataset.iframeId || '',
+      error: error && error.message ? error.message : String(error),
+    });
+    return 0;
+  }
+}
+
+function syncWidgetFrameHeight(frame, hintedHeight = 0) {
+  if (!frame) return;
+  const initialHeight = Math.max(0, Math.ceil(Number(frame.dataset.initialHeight || 0) || 0));
+  const localHeight = Math.max(0, measureWidgetFrameContentHeight(frame));
+  const prevHeight = Math.ceil(parseFloat(frame.style.height || '0') || 0);
+  const rawHintedHeight = Math.max(0, Math.ceil(Number(hintedHeight || 0) || 0));
+  const safeHintedHeight = (() => {
+    if (!rawHintedHeight) return 0;
+    if (!localHeight) {
+      const baseline = Math.max(prevHeight || initialHeight, 120);
+      const maxReasonableHeight = Math.max(baseline * 4, baseline + 2400);
+      return rawHintedHeight >= 120 && rawHintedHeight <= maxReasonableHeight ? rawHintedHeight : 0;
+    }
+    return rawHintedHeight <= localHeight + 96 ? rawHintedHeight : 0;
+  })();
+  const hasReliableHeight = localHeight > 0 || safeHintedHeight > 0;
+  const fallbackHeight = Math.max(120, prevHeight || initialHeight);
+  const nextHeight = hasReliableHeight
+    ? Math.max(120, localHeight || 0, safeHintedHeight || 0)
+    : fallbackHeight;
+  if (Math.abs(nextHeight - prevHeight) > 1) {
+    frame.style.height = nextHeight + 'px';
+  }
+
+  const wrap = frame.closest('.reply-wrap');
+  if (wrap && wrap.dataset.state === 'animating' && wrap.style.height && wrap.style.height !== 'auto') {
+    wrap.style.height = Math.max(
+      nextHeight + 72,
+      Math.ceil(wrap.scrollHeight || 0),
+      Math.ceil(wrap.getBoundingClientRect().height || 0)
+    ) + 'px';
+  }
+
+  const exchange = frame.closest('.exchange');
+  syncExchangeIntrinsicSize(exchange);
+  postPageHeight();
+  setTimeout(postPageHeight, 0);
+}
+
+function scheduleWidgetFrameHeightSync(frame) {
+  if (!frame) return;
+  [0, 80, 240, 700, 1500, 3000].forEach((delay) => {
+    setTimeout(() => {
+      syncWidgetFrameHeight(frame);
+      requestWidgetFrameHeight(frame);
+    }, delay);
+  });
+}
+
 function closeWidgetMenus(exceptFrameId = '') {
   document.querySelectorAll('.widget-menu').forEach((menu) => {
     const frameId = menu.dataset.widgetMenu || '';
@@ -995,9 +1120,7 @@ window.addEventListener('message', (event) => {
     if (!frame) return;
     const height = Number(data.height || 0);
     if (!Number.isFinite(height) || height <= 0) return;
-    frame.style.height = Math.max(120, Math.ceil(height)) + 'px';
-    postPageHeight();
-    setTimeout(postPageHeight, 0);
+    syncWidgetFrameHeight(frame, height);
     return;
   }
 
@@ -1027,6 +1150,13 @@ if (typeof ResizeObserver !== 'undefined') {
     pageResizeObserver.observe(container);
   }
 }
+
+document.querySelectorAll('.widget-iframe').forEach((frame) => {
+  frame.addEventListener('load', () => scheduleWidgetFrameHeightSync(frame));
+  scheduleWidgetFrameHeightSync(frame);
+  setTimeout(() => scheduleWidgetFrameHeightSync(frame), 120);
+  setTimeout(() => scheduleWidgetFrameHeightSync(frame), 480);
+});
 
 if (typeof IntersectionObserver !== 'undefined') {
   document.querySelectorAll('.toc-panel').forEach((panel) => {
