@@ -1,5 +1,7 @@
 let pageHeightRaf = 0;
 const widgetCaptureRequests = new Map();
+const widgetCaptureCache = new Map();
+const widgetPreviewWarmups = new Map();
 const runtimeConfig = (window.__CLAUDE_EXPORT_RUNTIME_CONFIG && typeof window.__CLAUDE_EXPORT_RUNTIME_CONFIG === 'object')
   ? window.__CLAUDE_EXPORT_RUNTIME_CONFIG
   : {};
@@ -546,8 +548,10 @@ function syncExchangeIntrinsicSize(exchange) {
 function setupLongConversationVirtualization() {
   const exchanges = Array.from(document.querySelectorAll('.exchange'));
   if (exchanges.length < 40 || !CSS.supports('content-visibility', 'auto')) return;
+  const virtualizableExchanges = exchanges.filter((exchange) => !exchange.querySelector('.widget-iframe'));
+  if (virtualizableExchanges.length === 0) return;
 
-  exchanges.forEach((exchange) => {
+  virtualizableExchanges.forEach((exchange) => {
     exchange.classList.add('is-virtualized');
     exchange.style.contentVisibility = 'auto';
     exchange.style.contain = 'layout style paint';
@@ -559,7 +563,7 @@ function setupLongConversationVirtualization() {
       entries.forEach((entry) => syncExchangeIntrinsicSize(entry.target));
       queuePageHeightPost();
     });
-    exchanges.forEach((exchange) => exchangeResizeObserver.observe(exchange));
+    virtualizableExchanges.forEach((exchange) => exchangeResizeObserver.observe(exchange));
   }
 }
 
@@ -902,8 +906,16 @@ function syncWidgetFrameHeight(frame, hintedHeight = 0) {
   const nextHeight = hasReliableHeight
     ? Math.max(120, localHeight || 0, safeHintedHeight || 0)
     : fallbackHeight;
+  if (hasReliableHeight) {
+    frame.dataset.measuredHeight = String(nextHeight);
+  }
   if (Math.abs(nextHeight - prevHeight) > 1) {
     frame.style.height = nextHeight + 'px';
+  }
+
+  syncWidgetFrameLoadingMode(frame);
+  if (hasReliableHeight) {
+    ensureWidgetDisplayPreview(frame);
   }
 
   const wrap = frame.closest('.reply-wrap');
@@ -942,6 +954,307 @@ function closeWidgetMenus(exceptFrameId = '') {
     menu.hidden = !keepOpen;
     menu.closest('.widget-toolbar')?.classList.toggle('is-open', keepOpen);
   });
+}
+
+function getTallWidgetDisplayThreshold() {
+  const viewportHeight = Math.max(
+    Number(window.innerHeight) || 0,
+    Number(document.documentElement && document.documentElement.clientHeight) || 0
+  );
+  return Math.max(480, Math.ceil(viewportHeight || 900));
+}
+
+function getWidgetEffectiveHeight(frame) {
+  if (!frame) return 0;
+  const initialHeight = Math.max(0, Math.ceil(Number(frame.dataset.initialHeight || 0) || 0));
+  const measuredHeight = Math.max(0, Math.ceil(Number(frame.dataset.measuredHeight || 0) || 0));
+  const styledHeight = Math.max(0, Math.ceil(parseFloat(frame.style.height || '0') || 0));
+  const boxHeight = Math.max(
+    0,
+    Math.ceil(frame.getBoundingClientRect().height || frame.clientHeight || frame.offsetHeight || 0)
+  );
+  return Math.max(initialHeight, measuredHeight, styledHeight, boxHeight);
+}
+
+function isTallWidgetFrame(frame) {
+  if (!frame) return false;
+  return getWidgetEffectiveHeight(frame) > getTallWidgetDisplayThreshold();
+}
+
+function getWidgetFrameLoadingMode(frame) {
+  if (!frame) return 'lazy';
+  return isTallWidgetFrame(frame) ? 'eager' : 'lazy';
+}
+
+function syncWidgetFrameLoadingMode(frame) {
+  if (!frame) return;
+  const nextMode = getWidgetFrameLoadingMode(frame);
+  if (frame.getAttribute('loading') !== nextMode) {
+    frame.setAttribute('loading', nextMode);
+  }
+  if (frame.loading !== nextMode) {
+    frame.loading = nextMode;
+  }
+}
+
+function isInteractiveWidgetFrame(frame) {
+  if (!frame) return false;
+  const annotatedBehavior = String(frame.dataset.widgetBehavior || '').trim().toLowerCase();
+  if (annotatedBehavior === 'interactive') return true;
+  if (annotatedBehavior === 'display') return false;
+  const srcdoc = String(frame.getAttribute('srcdoc') || frame.srcdoc || '');
+  if (!srcdoc) return false;
+  return /<(button|input|select|textarea|option|details|summary|dialog|form|audio|video)\b/i.test(srcdoc) ||
+    /\bcontenteditable(?:\s*=\s*["']?(?:true|plaintext-only)?["']?)?/i.test(srcdoc) ||
+    /\brole\s*=\s*["'](?:button|link|tab|switch|checkbox|radio|combobox|menuitem|menuitemcheckbox|menuitemradio|slider|spinbutton|textbox|searchbox|option|listbox|treeitem)["']/i.test(srcdoc) ||
+    /\btabindex\s*=\s*["']?(?:0|[1-9]\d*)["']?/i.test(srcdoc) ||
+    /<canvas\b/i.test(srcdoc) ||
+    /\bon(click|change|input|submit|keydown|keyup|mousedown|mouseup|pointerdown|pointerup|touchstart|touchend)\s*=/i.test(srcdoc) ||
+    /addEventListener\(\s*['"](click|change|input|submit|keydown|keyup|mousedown|mouseup|pointerdown|pointerup|touchstart|touchend)['"]/i.test(srcdoc);
+}
+
+function findWidgetTitle(frame) {
+  const wrapper = frame && frame.closest('.widget-wrapper');
+  const titleNode = wrapper && wrapper.querySelector('.widget-header');
+  return titleNode ? String(titleNode.textContent || '').replace(/^⚡\s*/, '').trim() : 'widget';
+}
+
+function getWidgetPreviewImage(frame) {
+  const frameId = frame && frame.dataset ? frame.dataset.iframeId || '' : '';
+  if (!frameId) return null;
+  const wrapper = frame.closest('.widget-wrapper');
+  return wrapper ? wrapper.querySelector('.widget-preview-image[data-widget-preview-for="' + frameId + '"]') : null;
+}
+
+function activateWidgetLiveFrame(frame, reason = 'preview-click') {
+  if (!frame) return false;
+  const wrapper = frame.closest('.widget-wrapper');
+  if (!wrapper || !wrapper.classList.contains('widget-wrapper--preview-ready')) return false;
+  if (wrapper.classList.contains('widget-wrapper--live-active')) return true;
+
+  wrapper.classList.add('widget-wrapper--live-active');
+  frame.dataset.previewState = 'live-active';
+  frame.removeAttribute('aria-hidden');
+  frame.removeAttribute('tabindex');
+  syncWidgetFrameHeight(frame);
+  requestWidgetFrameHeight(frame);
+  queuePageHeightPost();
+  appendRuntimeDebugLog('widget', 'display-preview-activated-live', {
+    frameId: frame.dataset.iframeId || '',
+    reason,
+  });
+  return true;
+}
+
+function sampleWidgetPreviewImage(image) {
+  if (!image || !image.complete || image.naturalWidth < 1 || image.naturalHeight < 1) return null;
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('2d');
+  if (!context) return null;
+
+  canvas.width = 24;
+  canvas.height = 24;
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  const data = context.getImageData(0, 0, canvas.width, canvas.height).data;
+  let totalBrightness = 0;
+  let whiteishCount = 0;
+  let coloredCount = 0;
+  for (let index = 0; index < data.length; index += 4) {
+    const red = data[index];
+    const green = data[index + 1];
+    const blue = data[index + 2];
+    const alpha = data[index + 3];
+    const brightness = (red + green + blue) / 3;
+    totalBrightness += brightness;
+    if (alpha > 0 && red > 240 && green > 240 && blue > 240) {
+      whiteishCount += 1;
+    }
+    if (alpha > 0 && (
+      Math.abs(red - green) > 12 ||
+      Math.abs(red - blue) > 12 ||
+      Math.abs(green - blue) > 12 ||
+      brightness < 230
+    )) {
+      coloredCount += 1;
+    }
+  }
+
+  const pixelCount = data.length / 4;
+  return {
+    avgBrightness: Math.round(totalBrightness / Math.max(1, pixelCount)),
+    whiteishRatio: whiteishCount / Math.max(1, pixelCount),
+    coloredRatio: coloredCount / Math.max(1, pixelCount),
+  };
+}
+
+function isSuspiciouslyBlankWidgetPreview(sample) {
+  if (!sample) return true;
+  return sample.avgBrightness >= 248 && sample.whiteishRatio >= 0.88 && sample.coloredRatio <= 0.08;
+}
+
+function applyWidgetDisplayPreview(frame, capture) {
+  if (!frame || !capture || !capture.dataUrl) return Promise.resolve(null);
+  const wrapper = frame.closest('.widget-wrapper');
+  if (!wrapper) return Promise.resolve(null);
+  const frameId = frame.dataset.iframeId || '';
+  let image = getWidgetPreviewImage(frame);
+  if (!image) {
+    image = document.createElement('img');
+    image.className = 'widget-preview-image';
+    image.decoding = 'async';
+    image.setAttribute('data-widget-preview-for', frameId);
+    image.setAttribute('data-widget-preview-activate', frameId);
+    image.alt = findWidgetTitle(frame) + ' preview';
+    image.title = '点击切换到交互模式';
+    wrapper.insertBefore(image, frame);
+  }
+  const finish = () => {
+    const sample = sampleWidgetPreviewImage(image);
+    if (isSuspiciouslyBlankWidgetPreview(sample)) {
+      image.remove();
+      appendRuntimeDebugLog('widget', 'display-preview-rejected', {
+        frameId,
+        reason: 'preview-looks-blank',
+        sample,
+      });
+      return null;
+    }
+    image.width = Math.max(1, Math.ceil(Number(capture.width) || 1));
+    image.height = Math.max(1, Math.ceil(Number(capture.height) || 1));
+    image.src = capture.dataUrl;
+    wrapper.classList.add('widget-wrapper--preview-ready');
+    frame.setAttribute('aria-hidden', 'true');
+    frame.tabIndex = -1;
+    queuePageHeightPost();
+    return image;
+  };
+  if (image.complete && image.currentSrc === capture.dataUrl) {
+    return Promise.resolve(finish());
+  }
+  return new Promise((resolve) => {
+    image.addEventListener('load', () => resolve(finish()), { once: true });
+    image.addEventListener('error', () => resolve(null), { once: true });
+    image.src = capture.dataUrl;
+  });
+}
+
+function warmWidgetDisplayPreview(frame) {
+  if (!isTallWidgetFrame(frame)) return Promise.resolve(null);
+  if (isInteractiveWidgetFrame(frame)) {
+    frame.dataset.previewState = 'skipped-interactive';
+    appendRuntimeDebugLog('widget', 'display-preview-skipped', {
+      frameId: frame.dataset.iframeId || '',
+      reason: 'interactive-widget',
+    });
+    return Promise.resolve(null);
+  }
+  const frameId = frame.dataset.iframeId || '';
+  if (!frameId) return Promise.resolve(null);
+  const existingWarmup = widgetPreviewWarmups.get(frameId);
+  if (existingWarmup) return existingWarmup;
+  const run = (async () => {
+    try {
+      frame.dataset.previewState = 'capturing';
+      const capture = await captureWidgetImage(frameId, 'display-preview');
+      const image = await applyWidgetDisplayPreview(frame, capture);
+      if (!image) {
+        frame.dataset.previewState = 'rejected';
+        return null;
+      }
+      frame.dataset.previewState = 'ready';
+      appendRuntimeDebugLog('widget', 'display-preview-ready', {
+        frameId,
+        width: Math.max(1, Math.ceil(Number(capture.width) || 1)),
+        height: Math.max(1, Math.ceil(Number(capture.height) || 1)),
+      });
+      return capture;
+    } catch (error) {
+      frame.dataset.previewState = 'failed';
+      appendRuntimeDebugLog('widget', 'display-preview-failed', {
+        frameId,
+        errorName: error && error.name ? error.name : '',
+        error: error && error.message ? error.message : String(error),
+      });
+      return null;
+    } finally {
+      widgetPreviewWarmups.delete(frameId);
+    }
+  })();
+  widgetPreviewWarmups.set(frameId, run);
+  return run;
+}
+
+function ensureWidgetDisplayPreview(frame) {
+  if (!frame || !isTallWidgetFrame(frame)) return Promise.resolve(null);
+  const wrapper = frame.closest('.widget-wrapper');
+  if (!wrapper || wrapper.classList.contains('widget-wrapper--preview-ready')) {
+    return Promise.resolve(null);
+  }
+  const previewState = String(frame.dataset.previewState || '');
+  if (previewState === 'capturing' || previewState === 'ready') {
+    return Promise.resolve(null);
+  }
+  return warmWidgetDisplayPreview(frame);
+}
+
+function getTallWidgetPreviewWarmupPriority(frame) {
+  if (!frame) {
+    return {
+      bucket: Number.POSITIVE_INFINITY,
+      distance: Number.POSITIVE_INFINITY,
+      absoluteTop: Number.POSITIVE_INFINITY,
+    };
+  }
+  const rect = frame.getBoundingClientRect();
+  const viewportHeight = Math.max(
+    Number(window.innerHeight) || 0,
+    Number(document.documentElement && document.documentElement.clientHeight) || 0
+  );
+  const absoluteTop = rect.top + window.scrollY;
+  if (rect.bottom < 0) {
+    return {
+      bucket: 2,
+      distance: viewportHeight + Math.abs(rect.bottom),
+      absoluteTop,
+    };
+  }
+  if (viewportHeight > 0 && rect.top > viewportHeight) {
+    return {
+      bucket: 1,
+      distance: rect.top - viewportHeight,
+      absoluteTop,
+    };
+  }
+  return { bucket: 0, distance: 0, absoluteTop };
+}
+
+function compareTallWidgetPreviewWarmupPriority(a, b) {
+  const aPriority = getTallWidgetPreviewWarmupPriority(a);
+  const bPriority = getTallWidgetPreviewWarmupPriority(b);
+  if (aPriority.bucket !== bPriority.bucket) {
+    return aPriority.bucket - bPriority.bucket;
+  }
+  if (aPriority.distance !== bPriority.distance) {
+    return aPriority.distance - bPriority.distance;
+  }
+  return aPriority.absoluteTop - bPriority.absoluteTop;
+}
+
+function warmTallWidgetDisplayPreviews() {
+  const tallFrames = Array.from(document.querySelectorAll('.widget-iframe'))
+    .filter((frame) => isTallWidgetFrame(frame))
+    .sort(compareTallWidgetPreviewWarmupPriority);
+  if (!tallFrames.length) return Promise.resolve([]);
+
+  let chain = Promise.resolve([]);
+  tallFrames.forEach((frame, index) => {
+    chain = chain.then(async (captures) => {
+      if (index > 0) await delay(60);
+      const capture = await warmWidgetDisplayPreview(frame);
+      return capture ? captures.concat([capture]) : captures;
+    });
+  });
+  return chain;
 }
 
 function requestWidgetCapture(frameId) {
@@ -1426,32 +1739,49 @@ async function renderWidgetCaptureWithHtml2Canvas(frameId) {
 }
 
 async function captureWidgetImage(frameId, reason = 'action') {
+  const cached = widgetCaptureCache.get(frameId);
+  if (cached) {
+    return cached instanceof Promise ? cached : Promise.resolve(cached);
+  }
+  const capturePromise = (async () => {
   try {
-    return await renderWidgetCaptureWithHtml2Canvas(frameId);
+      return await renderWidgetCaptureWithHtml2Canvas(frameId);
   } catch (primaryError) {
-    appendRuntimeDebugLog('widget', 'capture-html2canvas-failed', {
-      frameId,
-      reason,
-      errorName: primaryError && primaryError.name ? primaryError.name : '',
-      error: primaryError && primaryError.message ? primaryError.message : String(primaryError),
-    });
-    try {
-      return await requestWidgetCapture(frameId);
-    } catch (fallbackError) {
-      appendRuntimeDebugLog('widget', 'capture-runtime-failed', {
+      appendRuntimeDebugLog('widget', 'capture-html2canvas-failed', {
         frameId,
         reason,
-        errorName: fallbackError && fallbackError.name ? fallbackError.name : '',
-        error: fallbackError && fallbackError.message ? fallbackError.message : String(fallbackError),
+        errorName: primaryError && primaryError.name ? primaryError.name : '',
+        error: primaryError && primaryError.message ? primaryError.message : String(primaryError),
       });
-      const primaryMessage = primaryError && primaryError.message ? primaryError.message : String(primaryError || '');
-      const fallbackMessage = fallbackError && fallbackError.message ? fallbackError.message : String(fallbackError || '');
-      throw new Error(
-        [primaryMessage && 'html2canvas: ' + primaryMessage, fallbackMessage && 'runtime: ' + fallbackMessage]
-          .filter(Boolean)
-          .join('; ') || 'widget-capture-failed'
-      );
+      try {
+        return await requestWidgetCapture(frameId);
+      } catch (fallbackError) {
+        appendRuntimeDebugLog('widget', 'capture-runtime-failed', {
+          frameId,
+          reason,
+          errorName: fallbackError && fallbackError.name ? fallbackError.name : '',
+          error: fallbackError && fallbackError.message ? fallbackError.message : String(fallbackError),
+        });
+        const primaryMessage = primaryError && primaryError.message ? primaryError.message : String(primaryError || '');
+        const fallbackMessage = fallbackError && fallbackError.message ? fallbackError.message : String(fallbackError || '');
+        throw new Error(
+          [primaryMessage && 'html2canvas: ' + primaryMessage, fallbackMessage && 'runtime: ' + fallbackMessage]
+            .filter(Boolean)
+            .join('; ') || 'widget-capture-failed'
+        );
+      }
     }
+  })();
+  widgetCaptureCache.set(frameId, capturePromise);
+  try {
+    const capture = await capturePromise;
+    widgetCaptureCache.set(frameId, capture);
+    return capture;
+  } catch (error) {
+    if (widgetCaptureCache.get(frameId) === capturePromise) {
+      widgetCaptureCache.delete(frameId);
+    }
+    throw error;
   }
 }
 
@@ -1638,6 +1968,13 @@ document.addEventListener('click', (event) => {
     return;
   }
 
+  const widgetPreviewImage = event.target.closest('.widget-preview-image[data-widget-preview-activate]');
+  if (widgetPreviewImage) {
+    const frameId = widgetPreviewImage.dataset.widgetPreviewActivate || '';
+    activateWidgetLiveFrame(findWidgetFrame(frameId), 'preview-click');
+    return;
+  }
+
   const copyBtn = event.target.closest('[data-copy-source-id]');
   if (copyBtn) {
     copyAttachmentText(copyBtn.dataset.copySourceId, copyBtn);
@@ -1711,6 +2048,7 @@ if (typeof ResizeObserver !== 'undefined') {
 }
 
 document.querySelectorAll('.widget-iframe').forEach((frame) => {
+  syncWidgetFrameLoadingMode(frame);
   frame.addEventListener('load', () => scheduleWidgetFrameHeightSync(frame));
   scheduleWidgetFrameHeightSync(frame);
   setTimeout(() => scheduleWidgetFrameHeightSync(frame), 120);
@@ -1761,12 +2099,17 @@ window.addEventListener('load', () => {
   syncBulkReplyToggleButton();
   updatePromptTocPreviews();
   setupLongConversationVirtualization();
+  warmTallWidgetDisplayPreviews();
   postPageHeight();
   setTimeout(postPageHeight, 100);
   setTimeout(postPageHeight, 500);
 });
 window.addEventListener('resize', () => {
   updatePromptTocPreviews();
+  document.querySelectorAll('.widget-iframe').forEach((frame) => {
+    syncWidgetFrameLoadingMode(frame);
+    ensureWidgetDisplayPreview(frame);
+  });
   document.querySelectorAll('.exchange.is-virtualized').forEach((exchange) => {
     exchange.style.containIntrinsicSize = 'auto ' + estimateExchangeHeight(exchange) + 'px';
   });

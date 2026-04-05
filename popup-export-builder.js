@@ -997,6 +997,50 @@ function extractAndBuild(runId, options) {
   const postHeight = () => {
     parent.postMessage({ type: 'claude-export-widget-height', frameId, height: measureContentHeight() }, '*');
   };
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const waitForImages = (timeoutMs = 120) => Promise.race([
+    Promise.all(Array.from(document.images || []).map((img) => {
+      if (img.complete) return Promise.resolve();
+      return new Promise((resolve) => {
+        img.addEventListener('load', resolve, { once: true });
+        img.addEventListener('error', resolve, { once: true });
+      });
+    })),
+    delay(timeoutMs),
+  ]);
+  const waitForCaptureReady = async () => {
+    if (document.fonts && document.fonts.ready && typeof document.fonts.ready.then === 'function') {
+      await Promise.race([document.fonts.ready.catch(() => {}), delay(1500)]);
+    }
+    let lastSignature = '';
+    let stablePasses = 0;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await waitForImages(attempt < 3 ? 180 : 60);
+      const body = document.body;
+      const root = document.documentElement;
+      const width = Math.max(
+        1,
+        Math.ceil((root && root.scrollWidth) || (body && body.scrollWidth) || (body && body.getBoundingClientRect().width) || 1)
+      );
+      const height = Math.max(
+        1,
+        Math.ceil(measureContentHeight() || 0),
+        Math.ceil((body && body.scrollHeight) || 0),
+        Math.ceil((root && root.scrollHeight) || 0),
+        Math.ceil(window.innerHeight || 0)
+      );
+      const pendingImages = Array.from(document.images || []).filter((img) => !img.complete).length;
+      const signature = document.readyState + ':' + width + 'x' + height + ':' + pendingImages;
+      if (document.readyState === 'complete' && pendingImages === 0 && width > 0 && height > 0) {
+        stablePasses = signature === lastSignature ? stablePasses + 1 : 0;
+        if (stablePasses >= 2) return;
+      } else {
+        stablePasses = 0;
+      }
+      lastSignature = signature;
+      await delay(attempt < 4 ? 120 : 180);
+    }
+  };
   const drawDataUrlToCanvas = (dataUrl, width, height, scale, dpi) => new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
@@ -1097,6 +1141,7 @@ function extractAndBuild(runId, options) {
   };
   const respondWidgetCapture = async (requestId, scale, dpi) => {
     try {
+      await waitForCaptureReady();
       const capture = await captureWidgetImage(scale, dpi);
       parent.postMessage({
         type: 'claude-export-widget-capture-result',
@@ -1312,6 +1357,41 @@ function extractAndBuild(runId, options) {
     return innerHtml.split(emptyTagMarker).join(`<span class="t-tag">${closingLiteral}</span>`);
   }
 
+  function getWidgetInteractionAnalysisSource(widgetCode) {
+    return String(widgetCode || '')
+      .replace(/<!--[\s\S]*?-->/g, ' ')
+      .replace(/<style\b[\s\S]*?<\/style>/gi, ' ');
+  }
+
+  function getWidgetBehavior(widgetCode) {
+    const source = getWidgetInteractionAnalysisSource(widgetCode);
+    const lower = source.toLowerCase();
+    if (!lower.trim()) return 'display';
+
+    if (/<(button|input|select|textarea|option|details|summary|dialog|form|audio|video)\b/i.test(source)) {
+      return 'interactive';
+    }
+    if (/\bcontenteditable(?:\s*=\s*["']?(?:true|plaintext-only)?["']?)?/i.test(source)) {
+      return 'interactive';
+    }
+    if (/\brole\s*=\s*["'](?:button|link|tab|switch|checkbox|radio|combobox|menuitem|menuitemcheckbox|menuitemradio|slider|spinbutton|textbox|searchbox|option|listbox|treeitem)["']/i.test(source)) {
+      return 'interactive';
+    }
+    if (/\btabindex\s*=\s*["']?(?:0|[1-9]\d*)["']?/i.test(source)) {
+      return 'interactive';
+    }
+    if (/<canvas\b/i.test(source)) {
+      return 'interactive';
+    }
+    if (/\bon(click|change|input|submit|keydown|keyup|mousedown|mouseup|pointerdown|pointerup|touchstart|touchend)\s*=/i.test(source)) {
+      return 'interactive';
+    }
+    if (/addEventListener\(\s*['"](click|change|input|submit|keydown|keyup|mousedown|mouseup|pointerdown|pointerup|touchstart|touchend)['"]/i.test(source)) {
+      return 'interactive';
+    }
+    return 'display';
+  }
+
   function guessInitialWidgetHeight(widgetCode) {
     const source = String(widgetCode || '');
     const lower = source.toLowerCase();
@@ -1429,6 +1509,24 @@ function extractAndBuild(runId, options) {
     }
     if (lower.includes('<table') || lower.includes('<pre') || lower.includes('<code')) return 720;
     return 460;
+  }
+
+  // Use the export-time viewport as the "one screen" threshold for deciding
+  // whether a widget should opt out of lazy iframe loading.
+  function getWidgetEagerLoadingHeightThreshold() {
+    const viewportHeight = Number(
+      typeof window !== 'undefined' &&
+      window &&
+      Number.isFinite(Number(window.innerHeight))
+        ? window.innerHeight
+        : 0
+    ) || 0;
+    return Math.max(480, Math.ceil(viewportHeight || 900));
+  }
+
+  function getWidgetIframeLoadingMode(initialWidgetHeight) {
+    const widgetHeight = Math.max(0, Math.ceil(Number(initialWidgetHeight) || 0));
+    return widgetHeight > getWidgetEagerLoadingHeightThreshold() ? 'eager' : 'lazy';
   }
 
   // ── 提取数据 ────────────────────────────────────────────────────
@@ -1717,6 +1815,8 @@ function extractAndBuild(runId, options) {
             const iframeId = `widget-${messageKey}-${currentWidgetIndex}`;
             const srcdoc = makeWidgetSrcdoc(c.input.widget_code, iframeId, widgetImageExport);
             const initialWidgetHeight = guessInitialWidgetHeight(c.input.widget_code);
+            const widgetBehavior = getWidgetBehavior(c.input.widget_code);
+            const iframeLoadingMode = getWidgetIframeLoadingMode(initialWidgetHeight);
             const widgetTitle = c.input.title || 'widget';
             const wTitle = escHtml(widgetTitle);
             const widgetSectionId = makeAnchorId('widget', widgetTitle, widgetTocItems.length + 1);
@@ -1759,7 +1859,7 @@ function extractAndBuild(runId, options) {
       </div>
     </div>
     <div class="widget-header">⚡ ${wTitle}</div>
-    <iframe srcdoc="${srcdoc}" sandbox="allow-scripts" class="widget-iframe" style="height: ${initialWidgetHeight}px;" data-initial-height="${initialWidgetHeight}" data-iframe-id="${iframeId}" loading="lazy" scrolling="no"></iframe>
+    <iframe srcdoc="${srcdoc}" sandbox="allow-scripts" class="widget-iframe" style="height: ${initialWidgetHeight}px;" data-initial-height="${initialWidgetHeight}" data-widget-behavior="${widgetBehavior}" data-iframe-id="${iframeId}" loading="${iframeLoadingMode}" scrolling="no"></iframe>
   </div>
 </section>`);
           }

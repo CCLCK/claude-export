@@ -79,6 +79,7 @@ function createContext(messages, options = {}) {
       location: {
         pathname: `/chat/${options.chatUuid || 'chat-1'}`,
       },
+      innerHeight: options.windowInnerHeight,
     },
   };
 
@@ -103,6 +104,44 @@ async function runBuilder(messages, overrideOptions = {}) {
     widgetImageExport: { id: '300dpi', label: '300 DPI', scale: 3.125, dpi: 300 },
     ...overrideOptions,
   });
+}
+
+function extractNamedFunction(source, functionName) {
+  const signature = `function ${functionName}(`;
+  const start = source.indexOf(signature);
+  assert.notEqual(start, -1, `${functionName} should exist`);
+  const bodyStart = source.indexOf('{', start);
+  assert.notEqual(bodyStart, -1, `${functionName} should have a body`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === '{') depth += 1;
+    if (char === '}') depth -= 1;
+    if (depth === 0) {
+      return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Could not extract ${functionName}`);
+}
+
+function loadTallWidgetWarmupComparators(pageSource, overrides = {}) {
+  const context = {
+    window: { innerHeight: 1000, scrollY: 2000, ...(overrides.window || {}) },
+    document: { documentElement: { clientHeight: 1000, ...((overrides.documentElement) || {}) } },
+    Number,
+    Math,
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    [
+      extractNamedFunction(pageSource, 'getTallWidgetPreviewWarmupPriority'),
+      extractNamedFunction(pageSource, 'compareTallWidgetPreviewWarmupPriority'),
+      'this.compareTallWidgetPreviewWarmupPriority = compareTallWidgetPreviewWarmupPriority;',
+      'this.getTallWidgetPreviewWarmupPriority = getTallWidgetPreviewWarmupPriority;',
+    ].join('\n\n'),
+    context
+  );
+  return context;
 }
 
 test('md2html keeps valid list and code block structure', async () => {
@@ -431,6 +470,74 @@ test('parent page height sync can shrink from optimistic initial widget height',
   );
 });
 
+test('long conversation virtualization skips exchanges that embed widget iframes', () => {
+  const pageSource = fs.readFileSync('/Users/admin/PycharmProjects/TMP/claude-export/export-page.js', 'utf8');
+  assert.match(
+    pageSource,
+    /const virtualizableExchanges = exchanges\.filter\(\(exchange\) => !exchange\.querySelector\('\.widget-iframe'\)\);/
+  );
+  assert.match(pageSource, /virtualizableExchanges\.forEach\(\(exchange\) => \{/);
+  assert.match(pageSource, /virtualizableExchanges\.forEach\(\(exchange\) => exchangeResizeObserver\.observe\(exchange\)\);/);
+});
+
+test('tall widget display switches to captured preview images', () => {
+  const pageSource = fs.readFileSync('/Users/admin/PycharmProjects/TMP/claude-export/export-page.js', 'utf8');
+  const cssSource = fs.readFileSync('/Users/admin/PycharmProjects/TMP/claude-export/export-page.css', 'utf8');
+  assert.match(pageSource, /const widgetCaptureCache = new Map\(\);/);
+  assert.match(pageSource, /function warmTallWidgetDisplayPreviews\(\)/);
+  assert.match(pageSource, /function compareTallWidgetPreviewWarmupPriority\(a, b\) \{/);
+  assert.match(pageSource, /if \(aPriority\.bucket !== bPriority\.bucket\) \{/);
+  assert.match(pageSource, /\.sort\(compareTallWidgetPreviewWarmupPriority\);/);
+  assert.match(pageSource, /function activateWidgetLiveFrame\(frame, reason = 'preview-click'\)/);
+  assert.match(pageSource, /function isInteractiveWidgetFrame\(frame\)/);
+  assert.match(pageSource, /function sampleWidgetPreviewImage\(image\)/);
+  assert.match(pageSource, /function isSuspiciouslyBlankWidgetPreview\(sample\)/);
+  assert.match(pageSource, /image\.setAttribute\('data-widget-preview-activate', frameId\);/);
+  assert.match(pageSource, /widgetPreviewImage = event\.target\.closest\('\.widget-preview-image\[data-widget-preview-activate\]'\)/);
+  assert.match(pageSource, /wrapper\.classList\.add\('widget-wrapper--live-active'\);/);
+  assert.match(pageSource, /wrapper\.classList\.add\('widget-wrapper--preview-ready'\);/);
+  assert.match(pageSource, /frame\.dataset\.previewState = 'skipped-interactive';/);
+  assert.match(pageSource, /appendRuntimeDebugLog\('widget', 'display-preview-rejected'/);
+  assert.match(pageSource, /const cached = widgetCaptureCache\.get\(frameId\);/);
+  assert.match(pageSource, /warmTallWidgetDisplayPreviews\(\);/);
+  assert.match(cssSource, /\.widget-preview-image\s*\{/);
+  assert.match(cssSource, /\.widget-wrapper--preview-ready:not\(\.widget-wrapper--live-active\) \.widget-preview-image\s*\{/);
+  assert.match(cssSource, /\.widget-wrapper--preview-ready:not\(\.widget-wrapper--live-active\) \.widget-iframe\s*\{/);
+  assert.match(cssSource, /\.widget-wrapper--live-active \.widget-iframe\s*\{/);
+});
+
+test('only tall display widgets are eligible for preview mode', () => {
+  const pageSource = fs.readFileSync('/Users/admin/PycharmProjects/TMP/claude-export/export-page.js', 'utf8');
+  assert.match(pageSource, /function getWidgetEffectiveHeight\(frame\) \{/);
+  assert.match(pageSource, /function warmWidgetDisplayPreview\(frame\) \{\s*if \(!isTallWidgetFrame\(frame\)\) return Promise\.resolve\(null\);/);
+  assert.match(pageSource, /function isTallWidgetFrame\(frame\) \{/);
+  assert.match(pageSource, /return getWidgetEffectiveHeight\(frame\) > getTallWidgetDisplayThreshold\(\);/);
+  assert.match(pageSource, /function ensureWidgetDisplayPreview\(frame\) \{/);
+});
+
+test('interactive widgets stay on live iframe even when tall', () => {
+  const pageSource = fs.readFileSync('/Users/admin/PycharmProjects/TMP/claude-export/export-page.js', 'utf8');
+  const builderSource = fs.readFileSync('/Users/admin/PycharmProjects/TMP/claude-export/popup-export-builder.js', 'utf8');
+  assert.match(builderSource, /function getWidgetBehavior\(widgetCode\) \{/);
+  assert.match(builderSource, /data-widget-behavior="\$\{widgetBehavior\}"/);
+  assert.match(pageSource, /function isInteractiveWidgetFrame\(frame\) \{/);
+  assert.match(pageSource, /const annotatedBehavior = String\(frame\.dataset\.widgetBehavior \|\| ''\)\.trim\(\)\.toLowerCase\(\);/);
+  assert.match(pageSource, /if \(isInteractiveWidgetFrame\(frame\)\) \{\s*frame\.dataset\.previewState = 'skipped-interactive';/);
+  assert.match(pageSource, /appendRuntimeDebugLog\('widget', 'display-preview-skipped', \{/);
+});
+
+test('preview click permanently promotes a tall display widget back to live iframe', () => {
+  const pageSource = fs.readFileSync('/Users/admin/PycharmProjects/TMP/claude-export/export-page.js', 'utf8');
+  const cssSource = fs.readFileSync('/Users/admin/PycharmProjects/TMP/claude-export/export-page.css', 'utf8');
+  assert.match(pageSource, /function activateWidgetLiveFrame\(frame, reason = 'preview-click'\) \{/);
+  assert.match(pageSource, /wrapper\.classList\.add\('widget-wrapper--live-active'\);/);
+  assert.match(pageSource, /frame\.dataset\.previewState = 'live-active';/);
+  assert.match(pageSource, /activateWidgetLiveFrame\(findWidgetFrame\(frameId\), 'preview-click'\);/);
+  assert.match(cssSource, /\.widget-wrapper--preview-ready:not\(\.widget-wrapper--live-active\) \.widget-preview-image\s*\{/);
+  assert.match(cssSource, /\.widget-wrapper--live-active \.widget-preview-image\s*\{/);
+  assert.match(cssSource, /\.widget-wrapper--live-active \.widget-iframe\s*\{/);
+});
+
 test('html widget image export falls back to viewport-sized captures when measurement is unreliable', () => {
   assert.doesNotMatch(
     builderSource,
@@ -440,6 +547,159 @@ test('html widget image export falls back to viewport-sized captures when measur
     builderSource,
     /const exportHeight = Math\.max\(\s*1,\s*measuredHeight,[\s\S]*Math\.ceil\(window\.innerHeight \|\| 0\)/
   );
+});
+
+test('widget runtime capture waits for stable content before responding with a preview image', () => {
+  assert.match(builderSource, /const waitForCaptureReady = async \(\) => \{/);
+  assert.match(builderSource, /document\.fonts && document\.fonts\.ready/);
+  assert.match(builderSource, /const pendingImages = Array\.from\(document\.images \|\| \[\]\)\.filter\(\(img\) => !img\.complete\)\.length;/);
+  assert.match(builderSource, /await waitForCaptureReady\(\);\s*const capture = await captureWidgetImage\(scale, dpi\);/);
+});
+
+test('tall widget preview warmup prioritizes visible then below-viewport then above-viewport frames', () => {
+  const pageSource = fs.readFileSync('/Users/admin/PycharmProjects/TMP/claude-export/export-page.js', 'utf8');
+  const { compareTallWidgetPreviewWarmupPriority } = loadTallWidgetWarmupComparators(pageSource);
+  const visible = { id: 'visible', getBoundingClientRect: () => ({ top: 120, bottom: 860 }) };
+  const belowNear = { id: 'below-near', getBoundingClientRect: () => ({ top: 1040, bottom: 1700 }) };
+  const belowFar = { id: 'below-far', getBoundingClientRect: () => ({ top: 1420, bottom: 2100 }) };
+  const aboveNear = { id: 'above-near', getBoundingClientRect: () => ({ top: -240, bottom: -20 }) };
+  const aboveFar = { id: 'above-far', getBoundingClientRect: () => ({ top: -980, bottom: -420 }) };
+  const ordered = [aboveNear, belowFar, visible, aboveFar, belowNear].sort(compareTallWidgetPreviewWarmupPriority);
+  assert.deepEqual(ordered.map((frame) => frame.id), [
+    'visible',
+    'below-near',
+    'below-far',
+    'above-near',
+    'above-far',
+  ]);
+});
+
+test('tall widget preview warmup keeps stable order within the same bucket', () => {
+  const pageSource = fs.readFileSync('/Users/admin/PycharmProjects/TMP/claude-export/export-page.js', 'utf8');
+  const { compareTallWidgetPreviewWarmupPriority, getTallWidgetPreviewWarmupPriority } = loadTallWidgetWarmupComparators(pageSource);
+  const visibleTop = { id: 'visible-top', getBoundingClientRect: () => ({ top: 80, bottom: 420 }) };
+  const visibleLower = { id: 'visible-lower', getBoundingClientRect: () => ({ top: 360, bottom: 920 }) };
+  const belowNear = { id: 'below-near', getBoundingClientRect: () => ({ top: 1030, bottom: 1400 }) };
+  const belowFar = { id: 'below-far', getBoundingClientRect: () => ({ top: 1280, bottom: 1760 }) };
+  const ordered = [belowFar, visibleLower, belowNear, visibleTop].sort(compareTallWidgetPreviewWarmupPriority);
+  assert.deepEqual(ordered.map((frame) => frame.id), [
+    'visible-top',
+    'visible-lower',
+    'below-near',
+    'below-far',
+  ]);
+  const normalizedPriorities = JSON.parse(JSON.stringify(
+    [visibleTop, belowNear, belowFar].map((frame) => getTallWidgetPreviewWarmupPriority(frame))
+  ));
+  assert.deepEqual(
+    normalizedPriorities,
+    [
+      { bucket: 0, distance: 0, absoluteTop: 2080 },
+      { bucket: 1, distance: 30, absoluteTop: 3030 },
+      { bucket: 1, distance: 280, absoluteTop: 3280 },
+    ]
+  );
+});
+
+test('widget iframe loading mode uses the one-screen viewport threshold', async () => {
+  const widgetCode = '<table><tr><td>row</td></tr></table>';
+  const messages = [
+    {
+      uuid: 'h1',
+      index: 1,
+      sender: 'human',
+      content: [{ type: 'text', text: '给我一个表格 widget' }],
+    },
+    {
+      uuid: 'a1',
+      index: 2,
+      sender: 'assistant',
+      content: [
+        {
+          type: 'tool_use',
+          name: 'show_widget',
+          input: {
+            title: 'table_widget',
+            widget_code: widgetCode,
+          },
+        },
+      ],
+    },
+  ];
+
+  const eagerResult = await runBuilder(messages, { windowInnerHeight: 680 });
+  assert.equal(eagerResult.error, undefined);
+  assert.match(eagerResult.html, /class="widget-iframe"[^>]*style="height: 720px;"[^>]*loading="eager"/);
+
+  const lazyResult = await runBuilder(messages, { windowInnerHeight: 720 });
+  assert.equal(lazyResult.error, undefined);
+  assert.match(lazyResult.html, /class="widget-iframe"[^>]*style="height: 720px;"[^>]*loading="lazy"/);
+});
+
+test('runtime widget loading mode re-syncs against current viewport and measured height', () => {
+  const pageSource = fs.readFileSync('/Users/admin/PycharmProjects/TMP/claude-export/export-page.js', 'utf8');
+  assert.match(pageSource, /function getWidgetFrameLoadingMode\(frame\) \{/);
+  assert.match(pageSource, /function syncWidgetFrameLoadingMode\(frame\) \{/);
+  assert.match(pageSource, /frame\.dataset\.measuredHeight = String\(nextHeight\);/);
+  assert.match(pageSource, /syncWidgetFrameLoadingMode\(frame\);/);
+  assert.match(pageSource, /document\.querySelectorAll\('\.widget-iframe'\)\.forEach\(\(frame\) => \{\s*syncWidgetFrameLoadingMode\(frame\);/);
+});
+
+test('builder annotates widget behavior to keep runtime classification consistent', async () => {
+  const interactiveMessages = [
+    {
+      uuid: 'h1',
+      index: 1,
+      sender: 'human',
+      content: [{ type: 'text', text: '给我一个交互 widget' }],
+    },
+    {
+      uuid: 'a1',
+      index: 2,
+      sender: 'assistant',
+      content: [
+        {
+          type: 'tool_use',
+          name: 'show_widget',
+          input: {
+            title: 'interactive_widget',
+            widget_code: '<button type="button">切换</button>',
+          },
+        },
+      ],
+    },
+  ];
+  const displayMessages = [
+    {
+      uuid: 'h2',
+      index: 1,
+      sender: 'human',
+      content: [{ type: 'text', text: '给我一个展示 widget' }],
+    },
+    {
+      uuid: 'a2',
+      index: 2,
+      sender: 'assistant',
+      content: [
+        {
+          type: 'tool_use',
+          name: 'show_widget',
+          input: {
+            title: 'display_widget',
+            widget_code: '<div class="panel">静态摘要</div>',
+          },
+        },
+      ],
+    },
+  ];
+
+  const interactiveResult = await runBuilder(interactiveMessages);
+  assert.equal(interactiveResult.error, undefined);
+  assert.match(interactiveResult.html, /class="widget-iframe"[^>]*data-widget-behavior="interactive"/);
+
+  const displayResult = await runBuilder(displayMessages);
+  assert.equal(displayResult.error, undefined);
+  assert.match(displayResult.html, /class="widget-iframe"[^>]*data-widget-behavior="display"/);
 });
 
 test('svg widgets get a meaningful initial iframe height guess', async () => {
@@ -472,6 +732,7 @@ test('svg widgets get a meaningful initial iframe height guess', async () => {
   const match = result.html.match(/class="widget-iframe" style="height: (\d+)px;"/);
   assert.ok(match, 'widget iframe should include inline initial height');
   assert.ok(Number(match[1]) >= 360, 'svg widget initial height should not fall back to tiny default height');
+  assert.match(result.html, /class="widget-iframe"[^>]*loading="lazy"/);
 });
 
 test('grid widgets get taller initial iframe heights based on card count', async () => {
@@ -522,4 +783,5 @@ test('grid widgets get taller initial iframe heights based on card count', async
   const match = result.html.match(/class="widget-iframe" style="height: (\d+)px;"/);
   assert.ok(match, 'grid widget iframe should include inline initial height');
   assert.ok(Number(match[1]) >= 1400, 'grid widget initial height should scale with large card grids');
+  assert.match(result.html, /class="widget-iframe"[^>]*loading="eager"/);
 });
