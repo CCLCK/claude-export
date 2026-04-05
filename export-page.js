@@ -1046,7 +1046,7 @@ function buildWidgetCaptureBridgeSrcdoc(srcdoc, captureOptions) {
     scale: Math.max(1, Number(captureOptions && captureOptions.scale) || 1),
     dpi: Math.max(1, Number(captureOptions && captureOptions.dpi) || 96),
     initialWidth: Math.max(1, Math.ceil(Number(captureOptions && captureOptions.initialWidth) || 1)),
-    initialHeight: Math.max(1, Math.ceil(Number(captureOptions && captureOptions.initialHeight) || 1)),
+    preferredHeight: Math.max(1, Math.ceil(Number(captureOptions && captureOptions.preferredHeight) || 1)),
   };
 
   const captureBridgeSource = `
@@ -1161,7 +1161,7 @@ function buildWidgetCaptureBridgeSrcdoc(srcdoc, captureOptions) {
   const measureCaptureContentHeight = () => {
     const body = document.body;
     const root = document.documentElement;
-    if (!body || !root) return captureConfig.initialHeight || 120;
+    if (!body || !root) return captureConfig.preferredHeight || 120;
     const bodyRect = body.getBoundingClientRect();
     const bodyStyle = getComputedStyle(body);
     const paddingBottom = parseFloat(bodyStyle.paddingBottom || '0') || 0;
@@ -1201,7 +1201,7 @@ function buildWidgetCaptureBridgeSrcdoc(srcdoc, captureOptions) {
     const contentHeight = Math.max(120, Math.ceil(maxBottom + paddingBottom + 2));
     const fallbackHeight = Math.max(
       120,
-      captureConfig.initialHeight || 0,
+      captureConfig.preferredHeight || 0,
       Math.ceil(body.scrollHeight || 0),
       Math.ceil(body.offsetHeight || 0),
       Math.ceil(root.scrollHeight || 0),
@@ -1214,7 +1214,22 @@ function buildWidgetCaptureBridgeSrcdoc(srcdoc, captureOptions) {
     const body = document.body;
     const root = document.documentElement;
     const bodyRect = body ? body.getBoundingClientRect() : { width: 0, height: 0 };
+    const preferredHeight = Math.max(0, Math.ceil(Number(captureConfig.preferredHeight) || 0));
     const measuredHeight = Math.max(0, Math.ceil(measureCaptureContentHeight() || 0));
+    const fallbackHeight = Math.max(
+      1,
+      preferredHeight,
+      Math.ceil(root ? root.scrollHeight || 0 : 0),
+      Math.ceil(root ? root.offsetHeight || 0 : 0),
+      Math.ceil(body ? body.scrollHeight || 0 : 0),
+      Math.ceil(body ? body.offsetHeight || 0 : 0)
+    );
+    let resolvedHeight = fallbackHeight;
+    if (measuredHeight > 0) {
+      resolvedHeight = preferredHeight > 0 && measuredHeight <= preferredHeight + 8
+        ? preferredHeight
+        : measuredHeight;
+    }
     return {
       width: Math.max(
         1,
@@ -1223,17 +1238,7 @@ function buildWidgetCaptureBridgeSrcdoc(srcdoc, captureOptions) {
         Math.ceil(body ? body.scrollWidth || 0 : 0),
         Math.ceil(bodyRect.width || 0)
       ),
-      height: Math.max(
-        1,
-        measuredHeight,
-        captureConfig.initialHeight || 0,
-        Math.ceil(root ? root.scrollHeight || 0 : 0),
-        Math.ceil(root ? root.offsetHeight || 0 : 0),
-        Math.ceil(body ? body.scrollHeight || 0 : 0),
-        Math.ceil(body ? body.offsetHeight || 0 : 0),
-        Math.ceil(bodyRect.height || 0),
-        Math.ceil(window.innerHeight || 0)
-      ),
+      height: Math.max(1, resolvedHeight),
     };
   };
   const waitForImages = async (timeoutMs) => {
@@ -1353,6 +1358,7 @@ async function renderWidgetCaptureWithHtml2Canvas(frameId) {
     1,
     Math.ceil(Number(sourceFrame.dataset.initialHeight) || sourceFrame.clientHeight || sourceFrame.offsetHeight || 800)
   );
+  const stagingHeight = Math.max(initialHeight, 1200);
 
   return new Promise((resolve, reject) => {
     const requestId = frameId + '-html2canvas-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
@@ -1402,13 +1408,13 @@ async function renderWidgetCaptureWithHtml2Canvas(frameId) {
       scale: widgetImageExport && widgetImageExport.scale,
       dpi: widgetImageExport && widgetImageExport.dpi,
       initialWidth,
-      initialHeight: Math.max(initialHeight, 1200),
+      preferredHeight: initialHeight,
     });
     captureFrame.style.position = 'fixed';
     captureFrame.style.left = '-99999px';
     captureFrame.style.top = '0';
     captureFrame.style.width = initialWidth + 'px';
-    captureFrame.style.height = Math.max(initialHeight, 1200) + 'px';
+    captureFrame.style.height = stagingHeight + 'px';
     captureFrame.style.opacity = '0';
     captureFrame.style.pointerEvents = 'none';
     captureFrame.style.border = '0';

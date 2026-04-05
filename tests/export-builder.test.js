@@ -337,6 +337,9 @@ test('export embeds html2canvas widget capture support without iframe warmup hoo
   assert.match(pageSource, /function sanitizeWidgetCaptureSrcdoc\(srcdoc\)/);
   assert.match(pageSource, /function buildWidgetCaptureBridgeSrcdoc\(srcdoc, captureOptions\)/);
   assert.match(pageSource, /async function renderWidgetCaptureWithHtml2Canvas\(frameId\)/);
+  assert.match(pageSource, /preferredHeight: Math\.max\(1, Math\.ceil\(Number\(captureOptions && captureOptions\.preferredHeight\) \|\| 1\)\),/);
+  assert.match(pageSource, /const stagingHeight = Math\.max\(initialHeight, 1200\);/);
+  assert.match(pageSource, /preferredHeight: initialHeight,/);
   assert.match(pageSource, /captureFrame\.setAttribute\('sandbox', 'allow-scripts allow-same-origin'\);/);
   assert.match(pageSource, /claude-export-widget-html2canvas-result/);
   assert.match(pageSource, /function isWidgetFrameMessageSource\(frame, source\)/);
