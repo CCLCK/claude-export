@@ -41,8 +41,8 @@ function createContext(messages, options = {}) {
 
   const context = {
     console,
-    setTimeout,
-    clearTimeout,
+    setTimeout: options.setTimeout || setTimeout,
+    clearTimeout: options.clearTimeout || clearTimeout,
     AbortController,
     URL,
     Date,
@@ -283,6 +283,76 @@ test('exported html keeps critical DOM hooks and widget shell pieces', async () 
   assert.match(result.html, /data-raw="/);
   assert.match(result.html, /window\.__CLAUDE_EXPORT_RUNTIME_CONFIG/);
   assert.match(result.html, /rect\.c-gray/);
+});
+
+test('extractAndBuild unreferences progress cleanup timers', async () => {
+  const scheduledTimers = [];
+  const fakeSetTimeout = (callback, delay) => {
+    const timer = {
+      callback,
+      delay,
+      unrefCalled: false,
+      unref() {
+        this.unrefCalled = true;
+      },
+    };
+    scheduledTimers.push(timer);
+    return timer;
+  };
+  const fakeClearTimeout = () => {};
+  const messages = [
+    {
+      uuid: 'h1',
+      index: 1,
+      sender: 'human',
+      content: [{ type: 'text', text: '做一个最小导出' }],
+    },
+    {
+      uuid: 'a1',
+      index: 2,
+      sender: 'assistant',
+      content: [{ type: 'text', text: '好的。' }],
+    },
+  ];
+
+  const result = await runBuilder(messages, {
+    setTimeout: fakeSetTimeout,
+    clearTimeout: fakeClearTimeout,
+  });
+
+  assert.equal(result.error, undefined);
+  const cleanupTimer = scheduledTimers.find((timer) => timer.delay === 30000);
+  assert.ok(cleanupTimer, 'expected progress cleanup timer to be scheduled');
+  assert.equal(cleanupTimer.unrefCalled, true);
+});
+
+test('export embeds html2canvas widget capture support without iframe warmup hooks', () => {
+  const pageSource = fs.readFileSync('/Users/admin/PycharmProjects/TMP/claude-export/export-page.js', 'utf8');
+  const coreSource = fs.readFileSync('/Users/admin/PycharmProjects/TMP/claude-export/popup-core.js', 'utf8');
+  const uiSource = fs.readFileSync('/Users/admin/PycharmProjects/TMP/claude-export/popup-ui.js', 'utf8');
+  const captureLibSource = fs.readFileSync('/Users/admin/PycharmProjects/TMP/claude-export/html2canvas.min.js', 'utf8');
+
+  assert.ok(captureLibSource.length > 100000);
+  assert.match(pageSource, /const widgetCaptureLibrarySource = String\(window\.__CLAUDE_EXPORT_WIDGET_CAPTURE_LIB \|\| ''\);/);
+  assert.match(pageSource, /function sanitizeWidgetCaptureSrcdoc\(srcdoc\)/);
+  assert.match(pageSource, /function buildWidgetCaptureBridgeSrcdoc\(srcdoc, captureOptions\)/);
+  assert.match(pageSource, /async function renderWidgetCaptureWithHtml2Canvas\(frameId\)/);
+  assert.match(pageSource, /captureFrame\.setAttribute\('sandbox', 'allow-scripts allow-same-origin'\);/);
+  assert.match(pageSource, /claude-export-widget-html2canvas-result/);
+  assert.match(pageSource, /function isWidgetFrameMessageSource\(frame, source\)/);
+  assert.match(pageSource, /capture-html2canvas-failed/);
+  assert.match(pageSource, /capture-runtime-failed/);
+  assert.match(pageSource, /function downloadBlob\(blob, fileName\)/);
+  assert.match(pageSource, /const extension = capture\.fileExtension/);
+  assert.match(pageSource, /document\.execCommand\('copy'\)/);
+  assert.doesNotMatch(pageSource, /scheduleWidgetCaptureWarmup\(frameId, 'iframe-load', 180\)/);
+  assert.doesNotMatch(pageSource, /scheduleWidgetCaptureWarmup\(data\.frameId, 'height-sync', 260\)/);
+  assert.doesNotMatch(pageSource, /function ensureWidgetCaptureLibrary\(frame\)/);
+  assert.match(coreSource, /const pageScript = \(await loadTextResource\('export-page\.js'\)\)\.replace/);
+  assert.match(coreSource, /const widgetCaptureLib = \(await loadTextResource\('html2canvas\.min\.js'\)\)\.replace/);
+  assert.match(uiSource, /widgetCaptureLib: exportResources\.widgetCaptureLib/);
+  assert.match(builderSource, /const widgetCaptureLibResource = String\(\(options && options\.widgetCaptureLib\) \|\| ''\);/);
+  assert.match(builderSource, /window\.__CLAUDE_EXPORT_WIDGET_CAPTURE_LIB = /);
 });
 
 test('widget code demo escapes raw tags without swallowing later sections', async () => {

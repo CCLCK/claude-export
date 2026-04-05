@@ -4,6 +4,7 @@ const runtimeConfig = (window.__CLAUDE_EXPORT_RUNTIME_CONFIG && typeof window.__
   ? window.__CLAUDE_EXPORT_RUNTIME_CONFIG
   : {};
 const widgetImageExport = runtimeConfig.widgetImageExport || { id: '300dpi', label: '300 DPI', scale: 3.125, dpi: 300 };
+const widgetCaptureLibrarySource = String(window.__CLAUDE_EXPORT_WIDGET_CAPTURE_LIB || '');
 const runtimeDebugEnabled = Boolean(runtimeConfig.debugMode);
 const pt = window.__pretext || null;
 const runtimeDebugLogLimit = 160;
@@ -920,6 +921,10 @@ function syncWidgetFrameHeight(frame, hintedHeight = 0) {
   setTimeout(postPageHeight, 0);
 }
 
+function isWidgetFrameMessageSource(frame, source) {
+  return Boolean(frame && frame.contentWindow && source && frame.contentWindow === source);
+}
+
 function scheduleWidgetFrameHeightSync(frame) {
   if (!frame) return;
   [0, 80, 240, 700, 1500, 3000].forEach((delay) => {
@@ -963,34 +968,575 @@ function requestWidgetCapture(frameId) {
   });
 }
 
-async function dataUrlToBlob(dataUrl) {
-  const response = await fetch(dataUrl);
-  return response.blob();
+function dataUrlToBlob(dataUrl) {
+  const value = String(dataUrl || '');
+  const match = value.match(/^data:([^;,]+)?(?:;charset=[^;,]+)?(;base64)?,([\s\S]*)$/i);
+  if (!match) {
+    return fetch(value).then((response) => response.blob());
+  }
+
+  const mime = match[1] || 'application/octet-stream';
+  const encoded = match[3] || '';
+  const binary = match[2]
+    ? atob(encoded.replace(/\s+/g, ''))
+    : decodeURIComponent(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new Blob([bytes], { type: mime });
 }
 
-function downloadDataUrl(dataUrl, fileName) {
+function downloadBlob(blob, fileName) {
   const link = document.createElement('a');
-  link.href = dataUrl;
+  const objectUrl = URL.createObjectURL(blob);
+  link.href = objectUrl;
   link.download = fileName;
   document.body.appendChild(link);
   link.click();
   link.remove();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('blob-read-failed'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, Math.max(0, Number(ms) || 0));
+  });
+}
+
+function escapeInlineScriptSource(source) {
+  return String(source || '').replace(/<\/script/gi, '<\\/script');
+}
+
+function injectHtmlBeforeClosingTag(html, injection) {
+  const source = String(html || '');
+  if (/<\/body>/i.test(source)) {
+    return source.replace(/<\/body>/i, injection + '\n</body>');
+  }
+  if (/<\/html>/i.test(source)) {
+    return source.replace(/<\/html>/i, injection + '\n</html>');
+  }
+  return source + injection;
+}
+
+function sanitizeWidgetCaptureSrcdoc(srcdoc) {
+  return String(srcdoc || '')
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/\son[a-z-]+\s*=\s*"[^"]*"/gi, '')
+    .replace(/\son[a-z-]+\s*=\s*'[^']*'/gi, '')
+    .replace(/\son[a-z-]+\s*=\s*[^\s"'=<>`]+/gi, '');
+}
+
+function buildWidgetCaptureBridgeSrcdoc(srcdoc, captureOptions) {
+  if (!widgetCaptureLibrarySource.trim()) {
+    throw new Error('widget-capture-library-missing');
+  }
+
+  const captureConfig = {
+    requestId: String((captureOptions && captureOptions.requestId) || ''),
+    scale: Math.max(1, Number(captureOptions && captureOptions.scale) || 1),
+    dpi: Math.max(1, Number(captureOptions && captureOptions.dpi) || 96),
+    initialWidth: Math.max(1, Math.ceil(Number(captureOptions && captureOptions.initialWidth) || 1)),
+    initialHeight: Math.max(1, Math.ceil(Number(captureOptions && captureOptions.initialHeight) || 1)),
+  };
+
+  const captureBridgeSource = `
+(function () {
+  const captureConfig = ${JSON.stringify(captureConfig)};
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+  const readUint32 = (bytes, offset) => (
+    ((bytes[offset] << 24) >>> 0) +
+    ((bytes[offset + 1] << 16) >>> 0) +
+    ((bytes[offset + 2] << 8) >>> 0) +
+    (bytes[offset + 3] >>> 0)
+  );
+  const writeUint32 = (bytes, offset, value) => {
+    bytes[offset] = (value >>> 24) & 0xff;
+    bytes[offset + 1] = (value >>> 16) & 0xff;
+    bytes[offset + 2] = (value >>> 8) & 0xff;
+    bytes[offset + 3] = value & 0xff;
+  };
+  const concatUint8Arrays = (arrays) => {
+    const total = arrays.reduce((sum, array) => sum + array.length, 0);
+    const result = new Uint8Array(total);
+    let offset = 0;
+    arrays.forEach((array) => {
+      result.set(array, offset);
+      offset += array.length;
+    });
+    return result;
+  };
+  const crc32 = (() => {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i += 1) {
+      let c = i;
+      for (let j = 0; j < 8; j += 1) {
+        c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      }
+      table[i] = c >>> 0;
+    }
+    return (bytes) => {
+      let crc = 0xffffffff;
+      for (let i = 0; i < bytes.length; i += 1) {
+        crc = table[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+      }
+      return (crc ^ 0xffffffff) >>> 0;
+    };
+  })();
+  const makePngChunk = (type, data) => {
+    const typeBytes = new TextEncoder().encode(type);
+    const chunk = new Uint8Array(12 + data.length);
+    writeUint32(chunk, 0, data.length);
+    chunk.set(typeBytes, 4);
+    chunk.set(data, 8);
+    const crcInput = new Uint8Array(typeBytes.length + data.length);
+    crcInput.set(typeBytes, 0);
+    crcInput.set(data, typeBytes.length);
+    writeUint32(chunk, 8 + data.length, crc32(crcInput));
+    return chunk;
+  };
+  const makePhysChunk = (dpi) => {
+    const pixelsPerMeter = Math.max(1, Math.round(Number(dpi || captureConfig.dpi) / 0.0254));
+    const data = new Uint8Array(9);
+    writeUint32(data, 0, pixelsPerMeter);
+    writeUint32(data, 4, pixelsPerMeter);
+    data[8] = 1;
+    return makePngChunk('pHYs', data);
+  };
+  const dataUrlToBytes = (dataUrl) => {
+    const base64 = String(dataUrl || '').split(',')[1] || '';
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  };
+  const bytesToDataUrl = (bytes) => {
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 0x8000)));
+    }
+    return 'data:image/png;base64,' + btoa(binary);
+  };
+  const applyPngDpi = (dataUrl, dpi) => {
+    if (!String(dataUrl || '').startsWith('data:image/png')) return dataUrl;
+    const pngBytes = dataUrlToBytes(dataUrl);
+    if (pngBytes.length < 8) return dataUrl;
+    const signature = pngBytes.slice(0, 8);
+    const chunks = [];
+    let offset = 8;
+    let inserted = false;
+    while (offset + 12 <= pngBytes.length) {
+      const length = readUint32(pngBytes, offset);
+      const end = offset + 12 + length;
+      if (end > pngBytes.length) break;
+      const type = String.fromCharCode(
+        pngBytes[offset + 4],
+        pngBytes[offset + 5],
+        pngBytes[offset + 6],
+        pngBytes[offset + 7]
+      );
+      if (type !== 'pHYs') {
+        chunks.push(pngBytes.slice(offset, end));
+        if (!inserted && type === 'IHDR') {
+          chunks.push(makePhysChunk(dpi));
+          inserted = true;
+        }
+      }
+      offset = end;
+    }
+    if (!inserted) chunks.push(makePhysChunk(dpi));
+    return bytesToDataUrl(concatUint8Arrays([signature].concat(chunks)));
+  };
+  const measureCaptureContentHeight = () => {
+    const body = document.body;
+    const root = document.documentElement;
+    if (!body || !root) return captureConfig.initialHeight || 120;
+    const bodyRect = body.getBoundingClientRect();
+    const bodyStyle = getComputedStyle(body);
+    const paddingBottom = parseFloat(bodyStyle.paddingBottom || '0') || 0;
+    const candidates = Array.from(body.querySelectorAll('*')).filter((el) => el.tagName !== 'SCRIPT');
+    const viewportHeight = Math.max(body.clientHeight || 0, root.clientHeight || 0);
+
+    let maxBottom = 0;
+    for (const el of candidates) {
+      const rect = el.getBoundingClientRect();
+      const isViewportTetheredWrapper =
+        el.children &&
+        el.children.length > 0 &&
+        viewportHeight > 0 &&
+        rect.height >= viewportHeight * 0.9 &&
+        rect.bottom >= bodyRect.top + viewportHeight * 0.9 &&
+        rect.top <= bodyRect.top + 24;
+      if (isViewportTetheredWrapper) continue;
+      if (el.tagName === 'svg' || el.tagName === 'SVG') {
+        const svgRect = rect;
+        const viewBox = el.viewBox && el.viewBox.baseVal;
+        if (svgRect.width && svgRect.height && viewBox && viewBox.height > 0) {
+          try {
+            const bbox = el.getBBox();
+            if (bbox && Number.isFinite(bbox.y) && Number.isFinite(bbox.height) && bbox.height > 0) {
+              const contentBottom = Math.min(viewBox.height, bbox.y + bbox.height);
+              const scaledHeight = (contentBottom / viewBox.height) * svgRect.height;
+              maxBottom = Math.max(maxBottom, (svgRect.top - bodyRect.top) + scaledHeight + 2);
+              continue;
+            }
+          } catch (error) {}
+        }
+      }
+      if (!rect.width && !rect.height) continue;
+      maxBottom = Math.max(maxBottom, rect.bottom - bodyRect.top);
+    }
+
+    const contentHeight = Math.max(120, Math.ceil(maxBottom + paddingBottom + 2));
+    const fallbackHeight = Math.max(
+      120,
+      captureConfig.initialHeight || 0,
+      Math.ceil(body.scrollHeight || 0),
+      Math.ceil(body.offsetHeight || 0),
+      Math.ceil(root.scrollHeight || 0),
+      Math.ceil(root.offsetHeight || 0)
+    );
+    if (maxBottom > 0) return contentHeight;
+    return candidates.length > 0 ? 0 : fallbackHeight;
+  };
+  const measureCaptureDimensions = () => {
+    const body = document.body;
+    const root = document.documentElement;
+    const bodyRect = body ? body.getBoundingClientRect() : { width: 0, height: 0 };
+    const measuredHeight = Math.max(0, Math.ceil(measureCaptureContentHeight() || 0));
+    return {
+      width: Math.max(
+        1,
+        captureConfig.initialWidth || 0,
+        Math.ceil(root ? root.scrollWidth || 0 : 0),
+        Math.ceil(body ? body.scrollWidth || 0 : 0),
+        Math.ceil(bodyRect.width || 0)
+      ),
+      height: Math.max(
+        1,
+        measuredHeight,
+        captureConfig.initialHeight || 0,
+        Math.ceil(root ? root.scrollHeight || 0 : 0),
+        Math.ceil(root ? root.offsetHeight || 0 : 0),
+        Math.ceil(body ? body.scrollHeight || 0 : 0),
+        Math.ceil(body ? body.offsetHeight || 0 : 0),
+        Math.ceil(bodyRect.height || 0),
+        Math.ceil(window.innerHeight || 0)
+      ),
+    };
+  };
+  const waitForImages = async (timeoutMs) => {
+    const pending = Array.from(document.images || []).filter((img) => !img.complete);
+    if (!pending.length) return;
+    await Promise.race([
+      Promise.all(pending.map((img) => new Promise((resolve) => {
+        img.addEventListener('load', resolve, { once: true });
+        img.addEventListener('error', resolve, { once: true });
+      }))),
+      delay(timeoutMs),
+    ]);
+  };
+  const waitForCaptureReady = async () => {
+    if (document.fonts && document.fonts.ready && typeof document.fonts.ready.then === 'function') {
+      await Promise.race([document.fonts.ready.catch(() => {}), delay(1500)]);
+    }
+    let lastSignature = '';
+    let stablePasses = 0;
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      await waitForImages(attempt < 3 ? 180 : 60);
+      const dims = measureCaptureDimensions();
+      const pendingImages = Array.from(document.images || []).filter((img) => !img.complete).length;
+      const signature = document.readyState + ':' + dims.width + 'x' + dims.height + ':' + pendingImages;
+      if (document.readyState === 'complete' && pendingImages === 0 && dims.width > 0 && dims.height > 0) {
+        stablePasses = signature === lastSignature ? stablePasses + 1 : 0;
+        if (stablePasses >= 2) {
+          return dims;
+        }
+      } else {
+        stablePasses = 0;
+      }
+      lastSignature = signature;
+      await delay(attempt < 4 ? 120 : 180);
+    }
+    return measureCaptureDimensions();
+  };
+  const postResult = (payload) => {
+    parent.postMessage({
+      type: 'claude-export-widget-html2canvas-result',
+      requestId: captureConfig.requestId,
+      ...payload,
+    }, '*');
+  };
+  const runCapture = async () => {
+    try {
+      if (typeof window.html2canvas !== 'function') {
+        throw new Error('widget-capture-library-load-failed');
+      }
+      const body = document.body;
+      if (!body) {
+        throw new Error('widget-capture-body-missing');
+      }
+      const dims = await waitForCaptureReady();
+      const canvas = await window.html2canvas(body, {
+        backgroundColor: getComputedStyle(body).backgroundColor || '#ffffff',
+        scale: captureConfig.scale,
+        useCORS: true,
+        logging: false,
+        width: dims.width,
+        height: dims.height,
+        windowWidth: dims.width,
+        windowHeight: dims.height,
+        scrollX: 0,
+        scrollY: 0,
+      });
+      const dataUrl = applyPngDpi(canvas.toDataURL('image/png'), captureConfig.dpi);
+      postResult({
+        ok: true,
+        dataUrl,
+        width: canvas.width,
+        height: canvas.height,
+        mime: 'image/png',
+        fileExtension: 'png',
+      });
+    } catch (error) {
+      postResult({
+        ok: false,
+        error: error && error.message ? error.message : String(error),
+      });
+    }
+  };
+  if (document.readyState === 'complete') {
+    setTimeout(runCapture, 0);
+  } else {
+    window.addEventListener('load', () => {
+      setTimeout(runCapture, 0);
+    }, { once: true });
+  }
+})();
+`;
+
+  const inlineScripts = [
+    '<script id="claude-export-widget-capture-lib">' + escapeInlineScriptSource(widgetCaptureLibrarySource) + '</script>',
+    '<script>' + escapeInlineScriptSource(captureBridgeSource) + '</script>',
+  ].join('\n');
+
+  return injectHtmlBeforeClosingTag(sanitizeWidgetCaptureSrcdoc(srcdoc), inlineScripts);
+}
+
+async function renderWidgetCaptureWithHtml2Canvas(frameId) {
+  const sourceFrame = findWidgetFrame(frameId);
+  if (!sourceFrame) {
+    throw new Error('widget-frame-missing');
+  }
+  const srcdoc = sourceFrame.getAttribute('srcdoc') || sourceFrame.srcdoc || '';
+  if (!srcdoc) {
+    throw new Error('widget-srcdoc-missing');
+  }
+
+  const frameRect = sourceFrame.getBoundingClientRect();
+  const initialWidth = Math.max(
+    1,
+    Math.ceil(frameRect.width || sourceFrame.clientWidth || sourceFrame.offsetWidth || 1200)
+  );
+  const initialHeight = Math.max(
+    1,
+    Math.ceil(Number(sourceFrame.dataset.initialHeight) || sourceFrame.clientHeight || sourceFrame.offsetHeight || 800)
+  );
+
+  return new Promise((resolve, reject) => {
+    const requestId = frameId + '-html2canvas-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    const captureFrame = document.createElement('iframe');
+    const cleanup = () => {
+      window.removeEventListener('message', handleMessage);
+      clearTimeout(timeoutId);
+      captureFrame.remove();
+    };
+    const fail = (error) => {
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error || 'widget-capture-failed')));
+    };
+    const handleMessage = async (event) => {
+      const data = event.data || {};
+      if (data.type !== 'claude-export-widget-html2canvas-result' || data.requestId !== requestId) {
+        return;
+      }
+      if (!data.ok || !data.dataUrl) {
+        fail(new Error(data.error || 'widget-capture-failed'));
+        return;
+      }
+      try {
+        const blob = await dataUrlToBlob(data.dataUrl);
+        cleanup();
+        resolve({
+          blob,
+          dataUrl: String(data.dataUrl || ''),
+          width: Math.max(1, Math.ceil(Number(data.width) || 0)),
+          height: Math.max(1, Math.ceil(Number(data.height) || 0)),
+          mime: data.mime || blob.type || 'image/png',
+          fileExtension: data.fileExtension || 'png',
+        });
+      } catch (error) {
+        fail(error);
+      }
+    };
+    const timeoutId = setTimeout(() => {
+      fail(new Error('widget-capture-timeout'));
+    }, 12000);
+
+    captureFrame.setAttribute('aria-hidden', 'true');
+    captureFrame.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+    captureFrame.tabIndex = -1;
+    captureFrame.srcdoc = buildWidgetCaptureBridgeSrcdoc(srcdoc, {
+      requestId,
+      scale: widgetImageExport && widgetImageExport.scale,
+      dpi: widgetImageExport && widgetImageExport.dpi,
+      initialWidth,
+      initialHeight: Math.max(initialHeight, 1200),
+    });
+    captureFrame.style.position = 'fixed';
+    captureFrame.style.left = '-99999px';
+    captureFrame.style.top = '0';
+    captureFrame.style.width = initialWidth + 'px';
+    captureFrame.style.height = Math.max(initialHeight, 1200) + 'px';
+    captureFrame.style.opacity = '0';
+    captureFrame.style.pointerEvents = 'none';
+    captureFrame.style.border = '0';
+    captureFrame.style.visibility = 'hidden';
+
+    window.addEventListener('message', handleMessage);
+    document.body.appendChild(captureFrame);
+  });
+}
+
+async function captureWidgetImage(frameId, reason = 'action') {
+  try {
+    return await renderWidgetCaptureWithHtml2Canvas(frameId);
+  } catch (primaryError) {
+    appendRuntimeDebugLog('widget', 'capture-html2canvas-failed', {
+      frameId,
+      reason,
+      errorName: primaryError && primaryError.name ? primaryError.name : '',
+      error: primaryError && primaryError.message ? primaryError.message : String(primaryError),
+    });
+    try {
+      return await requestWidgetCapture(frameId);
+    } catch (fallbackError) {
+      appendRuntimeDebugLog('widget', 'capture-runtime-failed', {
+        frameId,
+        reason,
+        errorName: fallbackError && fallbackError.name ? fallbackError.name : '',
+        error: fallbackError && fallbackError.message ? fallbackError.message : String(fallbackError),
+      });
+      const primaryMessage = primaryError && primaryError.message ? primaryError.message : String(primaryError || '');
+      const fallbackMessage = fallbackError && fallbackError.message ? fallbackError.message : String(fallbackError || '');
+      throw new Error(
+        [primaryMessage && 'html2canvas: ' + primaryMessage, fallbackMessage && 'runtime: ' + fallbackMessage]
+          .filter(Boolean)
+          .join('; ') || 'widget-capture-failed'
+      );
+    }
+  }
+}
+
+function fallbackCopyWidgetImage(dataUrl, blob) {
+  let copyEventHandled = false;
+  const html = '<img src="' + escapeHtml(String(dataUrl || '')) + '" alt="widget image" />';
+  const copyListener = (event) => {
+    if (!event.clipboardData) return;
+    event.preventDefault();
+    copyEventHandled = true;
+    try {
+      event.clipboardData.setData('text/html', html);
+    } catch (error) {
+    }
+    try {
+      event.clipboardData.setData('text/plain', '[widget image]');
+    } catch (error) {
+    }
+    try {
+      if (blob && event.clipboardData.items && typeof event.clipboardData.items.add === 'function') {
+        event.clipboardData.items.add(blob);
+      }
+    } catch (error) {
+    }
+  };
+
+  document.addEventListener('copy', copyListener);
+  try {
+    const helper = document.createElement('div');
+    helper.contentEditable = 'true';
+    helper.setAttribute('aria-hidden', 'true');
+    helper.style.position = 'fixed';
+    helper.style.left = '-9999px';
+    helper.style.top = '0';
+    helper.style.opacity = '0';
+    helper.innerHTML = html;
+    document.body.appendChild(helper);
+
+    const selection = window.getSelection && window.getSelection();
+    if (!selection) {
+      helper.remove();
+      return false;
+    }
+    const range = document.createRange();
+    range.selectNodeContents(helper);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const copied = document.execCommand('copy');
+    selection.removeAllRanges();
+    helper.remove();
+    return Boolean(copied || copyEventHandled);
+  } finally {
+    document.removeEventListener('copy', copyListener);
+  }
 }
 
 async function copyWidgetImage(frameId, widgetTitle, trigger) {
   try {
-    const capture = await requestWidgetCapture(frameId);
-    const blob = await dataUrlToBlob(capture.dataUrl);
-    if (!navigator.clipboard || typeof navigator.clipboard.write !== 'function' || typeof ClipboardItem === 'undefined') {
-      throw new Error('clipboard-image-unsupported');
+    const capture = await captureWidgetImage(frameId, 'copy-action');
+    const blob = capture.blob instanceof Blob ? capture.blob : await dataUrlToBlob(capture.dataUrl);
+    const canUseAsyncClipboard =
+      navigator.clipboard &&
+      typeof navigator.clipboard.write === 'function' &&
+      typeof ClipboardItem !== 'undefined' &&
+      window.isSecureContext;
+
+    if (canUseAsyncClipboard) {
+      try {
+        await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+      } catch (clipboardError) {
+        const copied = fallbackCopyWidgetImage(capture.dataUrl, blob);
+        if (!copied) {
+          throw clipboardError;
+        }
+      }
+    } else {
+      const copied = fallbackCopyWidgetImage(capture.dataUrl, blob);
+      if (!copied) {
+        throw new Error('clipboard-image-unsupported');
+      }
     }
-    await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
     setTransientButtonContent(trigger, trigger.dataset.successHtml || '已复制', 'is-success');
     return true;
   } catch (error) {
     appendRuntimeDebugLog('widget', 'copy-image-failed', {
       frameId,
       widgetTitle,
+      secureContext: Boolean(window.isSecureContext),
+      hasClipboardWrite: Boolean(navigator.clipboard && typeof navigator.clipboard.write === 'function'),
+      hasClipboardItem: typeof ClipboardItem !== 'undefined',
+      errorName: error && error.name ? error.name : '',
       error: error && error.message ? error.message : String(error),
     });
     setTransientButtonContent(trigger, trigger.dataset.failureHtml || '复制失败', 'is-error');
@@ -1000,15 +1546,20 @@ async function copyWidgetImage(frameId, widgetTitle, trigger) {
 
 async function downloadWidgetImage(frameId, widgetTitle, trigger) {
   try {
-    const capture = await requestWidgetCapture(frameId);
-    const fileName = sanitizeExportName(widgetTitle || frameId) + '.png';
-    downloadDataUrl(capture.dataUrl, fileName);
+    const capture = await captureWidgetImage(frameId, 'download-action');
+    const blob = capture.blob instanceof Blob ? capture.blob : await dataUrlToBlob(capture.dataUrl);
+    const extension = capture.fileExtension
+      ? '.' + String(capture.fileExtension).replace(/^\.+/, '')
+      : '.png';
+    const fileName = sanitizeExportName(widgetTitle || frameId) + extension;
+    downloadBlob(blob, fileName);
     setTransientButtonContent(trigger, trigger.dataset.successHtml || '已开始下载', 'is-success');
     return true;
   } catch (error) {
     appendRuntimeDebugLog('widget', 'download-image-failed', {
       frameId,
       widgetTitle,
+      errorName: error && error.name ? error.name : '',
       error: error && error.message ? error.message : String(error),
     });
     setTransientButtonContent(trigger, trigger.dataset.failureHtml || '下载失败', 'is-error');
@@ -1117,7 +1668,7 @@ window.addEventListener('message', (event) => {
   const data = event.data || {};
   if (data.type === 'claude-export-widget-height') {
     const frame = findWidgetFrame(data.frameId);
-    if (!frame) return;
+    if (!isWidgetFrameMessageSource(frame, event.source)) return;
     const height = Number(data.height || 0);
     if (!Number.isFinite(height) || height <= 0) return;
     syncWidgetFrameHeight(frame, height);
@@ -1127,6 +1678,8 @@ window.addEventListener('message', (event) => {
   if (data.type === 'claude-export-widget-capture-result') {
     const pending = widgetCaptureRequests.get(data.requestId || '');
     if (!pending) return;
+    const frame = findWidgetFrame(data.frameId);
+    if (!isWidgetFrameMessageSource(frame, event.source)) return;
     clearTimeout(pending.timeoutId);
     widgetCaptureRequests.delete(data.requestId || '');
     if (data.ok && data.dataUrl) {

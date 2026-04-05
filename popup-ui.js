@@ -291,6 +291,7 @@ async function runExport(tab, { selectedUuids = null, sourceUrl = null, closeAft
         debugMode,
         pageCss: exportResources.pageCss,
         pageScript: exportResources.pageScript,
+        widgetCaptureLib: exportResources.widgetCaptureLib,
         widgetThemeCss: exportResources.widgetThemeCss,
         widgetShell: exportResources.widgetShell,
       }],

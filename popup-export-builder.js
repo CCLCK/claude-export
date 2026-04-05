@@ -7,6 +7,7 @@ function extractAndBuild(runId, options) {
   const debugMode = Boolean(options && options.debugMode);
   const pageCssResource = String((options && options.pageCss) || '');
   const pageScriptResource = String((options && options.pageScript) || '');
+  const widgetCaptureLibResource = String((options && options.widgetCaptureLib) || '');
   const widgetThemeCssResource = String((options && options.widgetThemeCss) || '');
   const widgetShellResource = String((options && options.widgetShell) || '');
   const selectedUuids = Array.isArray(options && options.selectedUuids) && options.selectedUuids.length > 0
@@ -85,8 +86,15 @@ function extractAndBuild(runId, options) {
       ...patch,
     };
   };
+  const scheduleDetachedTimeout = (callback, delay) => {
+    const timer = setTimeout(callback, delay);
+    if (timer && typeof timer.unref === 'function') {
+      timer.unref();
+    }
+    return timer;
+  };
   const scheduleProgressCleanup = () => {
-    setTimeout(() => {
+    scheduleDetachedTimeout(() => {
       if (progressStore[exportRunId]) delete progressStore[exportRunId];
     }, 30000);
   };
@@ -104,6 +112,7 @@ function extractAndBuild(runId, options) {
     hasPretextBundle: Boolean(pretextBundle),
     hasPageCss: Boolean(pageCssResource),
     hasPageScript: Boolean(pageScriptResource),
+    hasWidgetCaptureLib: Boolean(widgetCaptureLibResource),
     hasWidgetThemeCss: Boolean(widgetThemeCssResource),
     hasWidgetShell: Boolean(widgetShellResource),
   });
@@ -1854,6 +1863,9 @@ function extractAndBuild(runId, options) {
 
   // ── 页面样式 ─────────────────────────────────────────────────────
   const PAGE_CSS = pageCssResource || '';
+  const widgetCaptureLibScript = widgetCaptureLibResource
+    ? '<script>window.__CLAUDE_EXPORT_WIDGET_CAPTURE_LIB = ' + JSON.stringify(widgetCaptureLibResource).replace(/<\/script/gi, '<\\/script') + ';<\/script>'
+    : '';
   const runtimeConfigScript = '<script>window.__CLAUDE_EXPORT_RUNTIME_CONFIG = ' + JSON.stringify({
     debugMode,
     widgetImageExport,
@@ -1915,6 +1927,7 @@ window.__pretext = (typeof pretextExports !== 'undefined' && pretextExports)
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>${escHtml(chatTitle)}</title>
   <style>${PAGE_CSS}</style>
+  ${widgetCaptureLibScript}
   ${runtimeConfigScript}
 </head>
 <body>

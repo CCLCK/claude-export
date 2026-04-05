@@ -366,11 +366,13 @@ async function loadExportResources() {
     exportResourceCache = (async () => {
       const pageCss = await loadTextResource('export-page.css');
       const pageScript = (await loadTextResource('export-page.js')).replace(/<\/script/gi, '<\\/script');
+      const widgetCaptureLib = (await loadTextResource('html2canvas.min.js')).replace(/<\/script/gi, '<\\/script');
       const widgetThemeCss = await loadTextResource('widget-theme.css');
       const widgetShell = await loadTextResource('widget-srcdoc-shell.html');
       return {
         pageCss,
         pageScript,
+        widgetCaptureLib,
         widgetThemeCss,
         widgetShell,
       };
